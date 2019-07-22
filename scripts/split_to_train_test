@@ -1,0 +1,338 @@
+#!/bin/bash
+
+echo split_to_train_test $@
+
+exnum=10
+while [ $# -gt 0 ]; do
+	case "$1" in
+		"-svcomp") shift; svcomp='svcomp'$1;;
+		"-output-dir") shift; output_dir=$1;;
+
+		"-create-svm-input") do_create_svm_input=true;;
+		"-create-ans-weights") do_create_ans_weights=true;;
+		"-rem-ans-contr") rem_ans_contr=true;;
+		"-gen-files") do_gen_files=true;;
+		"-split-ans") do_split_ans=true;;
+		"-memsafety") memsafety=true;;
+		"-wo-memsafety") memsafety=false;;
+		"-scp-ans") do_scp_ans=true; shift; scp_ans_addr=$1;;
+
+		"-split-memsafety") do_split_memsafety=true;;
+		"-scp-memsafety") do_scp_memsafety=true; shift; scp_memsafety_addr=$1;;
+
+		"-create-cats") do_create_cats=true;;
+		"-rem-cats-contr") rem_cats_contr=true;;
+		"-split-cats") do_split_cats=true;;
+		"-scp-cats") do_scp_cats=true; shift; scp_cats_addr=$1;;
+
+		"-split-file") do_split_file=true; shift; user_file=$1; shift; file_num=$1;;
+		"-scp-file") do_scp_file=true; shift; user_file=$1; shift; file_num=$1; shift; scp_scores_addr=$1;;
+		"-scp-back") do_scp_back=true; shift; user_prefix=$1; shift; user_suff=$1; shift; remote_dir=$1; shift; local_dir=$1;;
+		"-exnum") shift; exnum=$1;;
+
+		"-ans-suff") shift; ans_suff=$1;;
+		"-cats-suff") shift; cats_suff=$1;;
+		"-weight-suff") shift; weight_suff=$1;;
+	esac
+	shift
+done
+
+if [ "$output_dir" == "" ]; then
+	echo specify -output-dir
+fi
+
+#DEBUG=true
+
+debug()
+{
+	if [ "$DEBUG" != "" ]; then
+		echo $1;
+	fi
+}
+
+cats_file=${SVM_DIR}/svcomp_cats
+answers_weights_prefix=ans_weights
+files_prefix=files
+cats_prefix=svm_cats
+cats_weights_prefix=cats_weights
+memsafety_prefix=svm_memsafety
+memsafety_weights_prefix=memsafety_weights
+scores_prefix=num_scores
+
+suff=""
+
+#scp_addr=zuerich:~/experiments/data/class/new_features
+
+files=$output_dir/files
+
+gen_files()
+{
+	echo generating the list of files...
+	file=$output_dir/${SVM_ANS_PREFIX}_0
+	col_num=`head -n 1 $file | wc -w`
+	let lastbutone=$col_num-1
+	tail -n +2 $file | cut -f 1-$lastbutone -d ' ' | sort -k 2 | uniq -f 1 | cut -f 1 -d ' ' > $files  #| uniq -f 1 
+	tail -n +2 $file | cut -f 1-$lastbutone -d ' ' | sort -k 2 | uniq -f 1 > result # | uniq -f 1 
+	echo "files=$files (`cat $files | wc -l` lines)"
+
+	echo splitting files into train and test...
+#	echo file class > ${TMP}_class
+#	cut -f 1,$cols -d ' ' $file >> ${TMP}_class
+#	join $files ${TMP}_class
+
+	tail -n +2 $file | cut -f 1-$lastbutone -d ' ' | sort -k 2 | uniq --all-repeated=separate -f 1 | cut -f 1 -d ' ' | sed ':a;N;$!ba;s/\n/ /g' | sed 's/  /\n/g' > groupped_files
+	tail -n +2 $file | cut -f 1-$lastbutone -d ' ' | sort -k 2 | uniq -u -f 1 | cut -f 1 -d ' ' >> groupped_files
+	debug "`cat groupped_files | wc -l` lines in groupped_files"
+
+	for ((ex=1;ex<=$exnum;ex++));do #$exnum
+		echo ex=$ex
+		mkdir -p $output_dir/ex${ex}
+		${SCRIPTS_DIR}/cross_validation -input $files -output ${TMP} -gen-input-only
+		debug "choosing all files with the same features..."
+		for mode in train test; do
+			tail -n +2 ${TMP}_${mode} > $TMP && mv $TMP ${TMP}_${mode}
+			debug "`cat ${TMP}_${mode} | wc -l` lines in ${TMP}_${mode}"
+
+			rm -f ${TMP}_uniq_features_${mode} # features
+#			touch features
+			while read line; do
+				line_re=`echo $line | sed 's%\.%\\\.%g'`
+#				features=`grep "$line_re" $file | cut -f 2-$lastbutone -d ' '`
+#				echo features=$features `grep "$features" $file | cut -f 1 -d ' ' | wc -l` lines
+#				echo "`cat ${TMP}_uniq_features_${mode} | wc -l` lines in ${TMP}_uniq_features_${mode}"
+#				if [ `grep "$features" features | wc -l` -gt 0 ]; then
+#					echo features=$features already in features! line=$line "("`grep "$features" features`")"
+#					exit 1;
+#				fi
+#				echo $line $features >> features
+#				grep "$features" $file | cut -f 1 -d ' ' >> ${TMP}_uniq_features_${mode}
+				grep "$line_re" groupped_files | sed 's# #\n#g' >> ${TMP}_uniq_features_${mode}
+			done < ${TMP}_${mode}
+
+			LC_ALL=C sort ${TMP}_uniq_features_${mode} > $TMP && mv $TMP ${TMP}_${mode}
+			debug "`cat ${TMP}_${mode} | wc -l` lines in ${TMP}_${mode}"
+		done
+
+		LC_ALL=C join --header ${TMP}_train ${TMP}_test > ${TMP}
+		if [ `cat ${TMP} | wc -l` -gt 1 ]; then
+			echo "`cat ${TMP} | wc -l` files intersect in $output_dir/ex${ex}/${files_prefix}_train and $output_dir/ex${ex}/${files_prefix}_test!"
+			exit
+		fi
+
+		for mode in train test; do
+			#mv ${TMP}_${mode} $output_dir/ex${ex}/${files_prefix}_${mode}
+
+			echo file > $output_dir/ex${ex}/${files_prefix}_${mode}
+			cat ${TMP}_${mode} >> $output_dir/ex${ex}/${files_prefix}_${mode}
+			#cat ${TMP}_${mode} | grep -v "^memsafety" | grep -v "^list-ext-properties" > $output_dir/ex${ex}/${files_prefix}_${mode}_wo_memsafety
+		done
+	done
+}
+
+create_cats()
+{
+	echo creating cats file...
+	file=$output_dir/${SVM_ANS_PREFIX}_0
+	cols=`head -n 1 $file | wc -w`
+	let cols--;
+	cut -f 1-$cols -d ' ' $file > ${TMP}_feat
+	
+	for ((cat=0;cat<$SVCOMP_CATS_NUM;cat++)); do
+		#echo cat=$cat
+		let col=$cat+2
+		cut -f 1,$col -d ' ' $cats_file | sed 's# 0$# 2#'  > ${TMP}_cat
+		LC_ALL=C join --header ${TMP}_feat ${TMP}_cat > $output_dir/${cats_prefix}_${cat}
+	done
+
+	echo creating cats weights...
+	tail -n +2 $output_dir/${cats_prefix}_0 | cut -f 1 -d ' ' > ${TMP}
+
+	for ((cat=0;cat<$SVCOMP_CATS_NUM;cat++)); do
+		output=$output_dir/${cats_weights_prefix}_${cat}
+		echo file weight > $output
+
+		while read line; do
+			echo $line 1 >> $output
+		done < $TMP
+	done
+}
+
+sort_file()
+{
+	if [ "$3" == true ]; then
+		head -n 1 $1 > ${TMP}1
+		tail -n +2 $1 > ${TMP}2
+	else
+		cp $1 ${TMP}2
+	fi
+	LC_ALL=C sort -k1,1 ${TMP}2 > ${TMP}3
+
+	if [ "$3" == true ]; then
+		cat ${TMP}1 ${TMP}3 > $2
+	else
+		cp ${TMP}3 $2
+	fi
+
+	rm -f ${TMP}{1,2,3}
+}
+
+split()
+{
+	inp_files=$1
+	weight_files=$2
+	num=$3
+	insuffs=("$suff" "")
+	modes=("train" "test train")
+	remove_label=$4	
+
+	let j=0
+	for prefix in $inp_files  $weight_files; do 
+		echo splitting $prefix...
+		for ((ex=1;ex<=$exnum;ex++)); do
+			debug "ex=$ex"
+			for mode in ${modes[$j]}; do
+				file1=${output_dir}/ex${ex}/${files_prefix}_${mode}${files_suff}
+				sort_file $file1 ${TMP}_1 true
+				for ((i=0;i<$num;i++)); do
+					#echo "join --header $output_dir/${prefix}_${i}${suff} ${output_dir}/ex${ex}/${files_prefix}_${mode} > $output_dir/ex${ex}/${prefix}_${i}_${mode}"
+					file2=$output_dir/${prefix}_${i}${insuffs[$j]}
+					sort_file $file2 ${TMP}_2 true
+					cmd="LC_ALL=C join --header ${TMP}_1 ${TMP}_2 > $output_dir/ex${ex}/${prefix}_${i}_${mode}"
+					#echo "$cmd";
+					eval "$cmd"
+					if [ "$memsafety" == true ]; then
+						head -n 1 $output_dir/ex${ex}/${prefix}_${i}_${mode} > $TMP
+						cat $output_dir/ex${ex}/${prefix}_${i}_${mode} | grep "^memsafety" >> ${TMP}
+						cat $output_dir/ex${ex}/${prefix}_${i}_${mode} | grep "^list-ext-properties" >> $TMP
+						mv $TMP $output_dir/ex${ex}/${prefix}_${i}_${mode}
+					elif [ "$memsafety" == false ]; then
+						cat $output_dir/ex${ex}/${prefix}_${i}_${mode} | grep -v "^memsafety" | grep -v "^list-ext-properties" > $TMP
+						mv $TMP $output_dir/ex${ex}/${prefix}_${i}_${mode}
+					fi
+				done;
+			done;
+			if [ "${modes[$j]}" == "train" ]; then
+				file1=${output_dir}/ex${ex}/${files_prefix}_test${files_suff}
+				file2=${output_dir}/${prefix}_0${insuffs[$j]}
+				colnum=`head -n 1 $file2 | wc -w`
+				let colnum--
+				if [ "$remove_label" == true ]; then
+					cut -f 1-$colnum -d ' ' $file2 > $TMP
+				else	
+					cp $file2 $TMP
+				fi
+				file3=${output_dir}/ex${ex}/${prefix}_test
+				cmd="LC_ALL=C join --header $file1 $TMP > $file3";
+				#echo "$cmd" &&
+				eval "$cmd"
+			fi
+		done
+		let j++
+	done
+}
+
+copy()
+{
+	local data_prefix=$1
+	local weight_prefix=$2
+	local num=$3
+	local scp_addr=$4
+	subdir=uniq
+	if [ "$weight_prefix" != "" ]; then prefix_str="{${data_prefix},${weight_prefix}}"; else prefix_str=${data_prefix}; fi
+
+	for ((ex=1;ex<=$exnum;ex++)); do
+		if [ $num -gt 1 ]; then s="{";else s="";fi
+		s="${s}0"
+		for ((i=1;i<$num;i++)); do s="${s},${i}"; done
+		if [ $num -gt 1 ]; then s="$s}"; fi
+		cmd="scp ${output_dir}/ex${ex}/${data_prefix}_${s}_train ${scp_addr}/ex${ex}/"
+		echo $cmd; eval $cmd
+		cmd="scp ${output_dir}/ex${ex}/${data_prefix}_test ${scp_addr}/ex${ex}/"
+		echo $cmd; eval $cmd
+
+
+		if [ "$weight_prefix" != "" ]; then
+			cmd="scp ${output_dir}/ex${ex}/${weight_prefix}_${s}_{train,test} ${scp_addr}/ex${ex}/"
+			echo $cmd; eval $cmd
+		fi
+
+		#cmd="scp ${output_dir}/ex${ex}/${weight_prefix}${weight_suff}_${i}_${mode} ${scp_addr}/ex${ex}/${subdir}-unknown/"
+		#echo $cmd; eval $cmd
+	done
+}
+
+copy_back()
+{
+	#svcomp=svcomp14; prefix='answers'; suff='_woassert'; dir='new_features_flipped'; local_dir='flipped_subset';
+	prefix=$1; suff=$2; echo "suff=$suff"; dir=$3; local_dir=$4;
+	for ((ex=1;ex<=${exnum};ex++)); do
+		remote_path=/home/demy/experiments/data/class/svcomp${SVCOMP}/${dir}/ex${ex}/uniq-unknown
+		local_path=${local_dir}/ex${ex}
+		mkdir -p ${local_path};
+		cmd="scp zuerich:${remote_path}/tool_choice_svm_${prefix}${suff}_pure_ans ${local_path}/tool_choice_svm_${prefix}${suff}_pure_ans";
+#		cmd="scp zuerich:${remote_path}/tool_choice_svm_${prefix}${suff}_pure_ans ${local_path}/../tool_choice_svm_${prefix}${suff}_pure_ans_${ex}";
+		echo "$cmd" && eval "$cmd";
+#		cmd="scp zuerich:${remote_path}/svm_${prefix}${suff}_{predictions,prob_estimates}_*_files ${local_path}";
+#		echo "$cmd" && eval "$cmd";
+	done
+}
+
+if [ "$do_create_svm_input" == true ]; then
+	create_svm_input;
+fi
+
+if [ "$do_create_ans_weights" == true ]; then
+	create_ans_weights
+fi
+
+if [ "$rem_ans_contr" == true ]; then
+	remove_contradictions $SVM_ANS_PREFIX $SVCOMP_TOOLS_NUM
+fi
+
+if [ "$do_gen_files" == true ]; then
+	gen_files
+fi
+
+if [ "$do_split_ans" == true ]; then
+	split ${SVM_ANS_PREFIX}${ans_suff} ${answers_weights_prefix}${weight_suff} $SVCOMP_TOOLS_NUM true;
+fi
+
+if [ "$do_create_cats" == true ]; then
+	create_cats
+fi
+
+if [ "$rem_cats_contr" == true ]; then
+	remove_contradictions $cats_prefix $SVCOMP_CATS_NUM
+fi
+
+if [ "$do_split_cats" == true ]; then
+	split ${cats_prefix}${cats_suff} $cats_weights_prefix $SVCOMP_CATS_NUM true;
+fi
+
+if [ "$do_scp_ans" == true ]; then
+	copy ${SVM_ANS_PREFIX}${ans_suff} ${answers_weights_prefix}${weight_suff} $SVCOMP_TOOLS_NUM $scp_ans_addr
+fi
+
+if [ "$do_scp_cats" == true ]; then
+	copy ${cats_prefix}${cats_suff} ${cats_weights_prefix} $SVCOMP_CATS_NUM $scp_cats_addr -svcomp svcomp15
+fi
+
+if [ "$do_split_memsafety" == true ]; then
+	split ${memsafety_prefix}${memsafety_suff} ${memsafety_weights_prefix}${weight_suff} $SVCOMP_TOOLS_NUM;
+fi
+
+if [ "$do_scp_memsafety" == true ]; then
+	copy ${memsafety_prefix}${memsafety_suff} ${memsafety_weights_prefix}${weight_suff} $SVCOMP_TOOLS_NUM $scp_memsafety_addr
+fi
+
+if [ "$do_split_file" == true ]; then
+	split ${user_file} "" $file_num;
+fi
+
+if [ "$do_scp_file" == true ]; then
+	copy $user_file "" $file_num $scp_scores_addr
+fi
+
+if [ "$do_scp_back" == true ]; then
+	copy_back "${user_prefix}" "${user_suff}" "$remote_dir" "$local_dir" "$exnum"
+fi

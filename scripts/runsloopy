@@ -1,0 +1,23 @@
+#!/bin/bash
+
+SLOOPY=sloopy
+
+if [[ ! -t 0 ]] ; then
+
+  parallel --progress --colsep '\t' $SLOOPY -ml -bench-name="{1}" "{1}" -- -w '$(echo {2})'
+
+elif [[ -f "$1" ]] ; then
+
+  benchmark=$1
+  shift
+
+  echo -e "benchmark\tbounded\tterminating\tsimple\ttnont\thard\tfpcalls\tfpargs\tcfgblocks\tmaxindeg\ttimesloopy\ttimesloopyloop\ttimesloopycfg\ttimesloopyparse"
+
+  $SLOOPY -ml -bench-name="$benchmark" "$benchmark" -- -w "$@"
+
+else
+
+  echo "Usage: \"$0 < path/to/listoffiles\" or \"$0 path/to/file.c\""
+  exit 1
+
+fi

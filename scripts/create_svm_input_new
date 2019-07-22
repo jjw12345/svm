@@ -1,0 +1,602 @@
+#!/bin/bash
+
+stat_portion=${TMP}_stat_portion
+DEBUG=true
+
+debug()
+{
+	if [ "$DEBUG" != "" ]; then
+		echo $1;
+	fi
+}
+
+
+debug TMP=$TMP
+#debug "create_svm_input $@"
+
+with_loops=false;
+svcomp_assert_vars=false;
+svcomp_assert_vars_only=false;
+property=false;
+expected_result=false;
+inputfile=statistics.txt
+besttool=false;
+besttool_ova=false;
+only_features=false;
+do_split_cols=false;
+do_sort_file=false;
+do_create_weights1=false;
+
+#echo BENCHMARK_DIR=$BENCHMARK_DIR
+
+joined=joined
+while [ $# -gt 0 ]; do
+	case "$1" in 
+		"-prop") property=true;;
+		"-assert") svcomp_assert_vars=true; joined="${joined}_$1";;
+		"-onlyassert") svcomp_assert_vars_only=true; joined="${joined}_$1";;
+		"-expres") expected_result=true;;
+		"-besttool") besttool=true;;
+		"-besttool-ova") besttool_ova=true; shift; besttool_ova_filename=$1;;
+		#"-SVCOMP") shift; SVCOMP=$1;;
+		"-scores") shift; scores=$1;;
+		"-output-dir") shift; output_dir=$1;;
+		"-output-prefix") shift;output_prefix=$1;;
+		#"-loops") shift; LOOPS_FILE=$1;;
+		"-split-cols") do_split_cols=true; shift; input_file=$1; shift; output_file=$1;;
+		"-sort-file") do_sort_file=true; shift; input_file=$1; shift; output_file=$1;;
+		"-create-weights1") do_create_weights1=true; shift; input_file=$1; shift; output_file=$1; shift; output_num=$1;;
+		"-extract-roles-metrics") extract_roles_metrics=true;;
+		"-roles-metrics") shift; roles_metrics=$1;;
+		"-extract-loops-metrics") extract_loop_metrics=true;;
+		"-loops-metrics") shift; loops_metrics=$1;;
+		"-create-input") create_input=true;;
+		"-file") shift; file=$1;;
+	esac
+	shift
+done
+joined=${output_dir}/$joined
+#echo joined=$joined
+
+if [ "$output_dir" == "" ]; then
+	echo output_dir is empty; exit 1
+elif [ "$SVCOMP" == "" ]; then
+	echo SVCOMP is empty; exit 1
+elif [ "create-input" == true ]; then
+	if [ "$scores" == "" ]; then # && [ $only_features != true ]; then
+		echo scores is empty; exit 1
+	elif [ "$output_prefix" == "" ]; then
+		echo output_prefix is empty; exit 1
+	fi
+fi
+
+if [ "$file" == "" ]; then
+TASKS=(svcomp$SVCOMP)
+else
+TASKS=($file)
+fi
+
+#echo SVCOMP_CATS=${SVCOMP_CATS[@]}
+
+#declare -A SVCOMP_CATS
+#SVCOMP_CATS[svcomp13]="BitVectors Concurrency ControlFlowInteger-MemPrecise ControlFlowInteger-MemSimple DeviceDrivers64 FeatureChecks Loops MemorySafety ProductLines SystemC HeapManipulation"
+#SVCOMP_CATS[svcomp14]="BitVectors Concurrency ControlFlowInteger DeviceDrivers64 HeapManipulation Loops MemorySafety ProductLines Recursive Sequentialized Simple"
+# demonstration categories: Stateful DriverChallenges 
+#SVCOMP_CATS[svcomp15]="Arrays BitVectors Concurrency ControlFlowInteger DeviceDrivers64 ECA Loops ProductLines HeapManipulation MemorySafety Recursive Sequentialized Simple Floats Termination-crafted"
+
+MUX=0
+if [ $MUX == 1 ]; then
+ROLES=(LOCAL_VAR COND_STMT FORM_OR_LOCAL_VAR FUNC_CALL LOCAL_SCALAR_INT \
+	LOCAL_SCALAR LOCAL_STRUCT LOCAL_PTR LOCAL_PTR_STRUCT LOCAL_PTR_VOID \
+	LOCAL_PTR_FUNCTION BITVECTOR)
+else
+ROLES=(SYNT_CONST CONST_ASSIGN COUNTER PURE_COUNTER LINEAR PURE_LINEAR \
+	BOOL PURE_BOOLEAN COMPARED_TO_CONST MODE LOOP_IT LOOP_BOUND \
+	ARRAY_INDEX OFFSET ARRAY_SIZE FILE_DESCR INPUT BRANCH_COND \
+	BITVECTOR CHAR UNRES_DATA SCALAR_INT SCALAR_FLOAT \
+	SCALAR PTR PTR_SCALAR PTR_STRUCT PTR_STRUCT_PTR PTR_STRUCT_REC \
+	PTR_COMPL_STRUCT_REC HEAP_PTR \
+	THREAD_DESCR USED_IN_ARITHM \
+	EXTERNAL_VAR RECURSIVE_FUNC STRUCT_FIELD)
+fi
+#echo ROLES=${ROLES[@]}
+
+get_category_score()
+{
+	col=$1; shift
+	cat=$1; shift
+
+	for ((i=1;i<$col;i++)); do
+		if [ $# -gt 0 ]; then shift
+		else echo incorrect column number; exit 1; fi
+	done
+	score=$1
+	if [ "$score" == "-" ]; then
+		score="0.0"
+	fi
+}
+
+get_dirs()
+{
+	dirs=""
+	while read str; do
+		if [ "$str" == "" ]; then continue; fi
+		dir=`dirname $str`
+		dir=`echo $dir | tr -d '-'`
+		dirs="$dirs $dir"
+	done < $1
+}
+
+get_files()
+{
+	files=""
+	cat ${BENCHMARK_DIR}/${1}.set | sed '/^\s*$/d' | sed 's!^!'${BENCHMARK_DIR}/'!' > $TMP
+	while read line; do
+		if [ "$line" != "" ]; then
+			files="$files "`find ${BENCHMARK_DIR}/ -path "$line"`
+			#echo line=$line files=$files
+		fi
+	done < $TMP
+#	echo $files > $s_tmp
+	rm $TMP
+}
+
+role_frequency()
+{
+	# Usage: role_frequency <role> <statistitics_file>
+	# Output: stores the role frequency in the variable freq
+
+	#echo role_frequency '$1='$1 '$2='$2
+
+	freq=`sed -n '
+		/Simple roles:/ { 
+		:search 
+			n 
+			s/^\<'$1'\>.*(\(.*\)%)$/\1/p
+			b search
+		}
+	' $2`
+
+	if [ "$freq" = "" ]; then freq="0.00"; fi
+}
+
+declare -A SCORES
+declare -A FILES
+read_scores()
+{
+	while read line; do
+		get_category_score $tool $line
+		cat=`echo $cat | sed -n 's/^13_\(.*\)$/\1/p'`
+		categories="$categories $cat"
+		SCORES[$cat]=$score
+		get_files $cat 
+		FILES[$cat]=$files
+		#echo cat=$cat score=$score "SCORES[\$cat]="${SCORES[$cat]} #categories=$categories
+	done < $1
+}
+
+get_file_category()
+{
+	file=`echo $1 | sed 's#\.sliced\.c##'`
+	cat=""
+	for c in $categories; do
+		if [ "`echo ${FILES[$c]} | grep $file`" != "" ]; then cat=$c; break; fi
+	done
+	if [ "$cat" == "" ]; then echo "couldn't detect category for $file"; exit 1; fi
+}
+
+get_file_score()
+{
+	file=`echo "$1" | sed 's#\.sliced\.c##;s#'$BENCHMARK_DIR'\/##;s#\.#\\\.#g'`
+	local line=`cat $scores | grep "$file"`
+	score=0.0
+	found_score=false
+
+	if [ "$line" == "" ]; then
+		echo $file not found in $scores; exit 1;
+	elif [ ${SVCOMP_TOOLS_NUM} -ne `echo $line | cut -d ' ' -f 2- | wc -w` ]; then
+		echo the \# of columns in score line is greater than the \# of tools, filename=$file; exit 1
+	else
+		let col=$2+2
+		score=`echo $line | cut -d ' ' -f $col`
+
+		if [ $besttool == false ]; then #when besttool is set to true, we pass besttool_ova instead of scores
+			case $score in
+				'+') score='1';;
+				'-') score='2';;
+				'0'|'?') score='3';;
+				*) echo undefined score: $score; exit 1;
+			esac
+		fi
+
+		found_score=true
+	fi
+}
+
+get_file_portion()
+{
+	# input linenum separator output
+	inp=$1
+	linenum=$2
+	sep=$3
+	out=$4
+	if [ "$linenum" -gt 1 ]; then
+		tail -n +"$linenum" "$inp" > $TMP
+	else
+		cp $inp $TMP
+	fi
+
+#	echo get_file_portion sep=$sep
+	rm -f $out
+	if [ -f $TMP ]; then
+		while read line; do
+			#echo $line
+			res=`echo "$line" | grep "$sep"`
+			if [ -f "$out" ] && [ "$res" != "" ]; then break; fi
+			if [ "$line" != "" ]; then echo $line >> $out; fi
+			let linenum++
+		done < $TMP
+	fi
+}
+
+get_output()
+{
+	let tnum=$1 #-1
+	output=${output_dir}/${output_prefix}_${tnum}
+}
+
+normalise()
+{
+	#echo normalise
+	rm -f $TMP
+	while read line; do
+		#echo $line
+		i=0
+		for word in $line; do
+			if [ $i -eq 0 ]; then
+				echo -n $word >> $TMP
+				let i++
+			else
+				num=`echo "scale=2; ($word / 100)" | bc`
+				echo -n ' '$num >> $TMP
+			fi
+		done
+		echo >> $TMP
+	done < $1
+	mv $TMP $1
+}
+
+cat_roles()
+{
+	rm -f $1
+	for task in ${TASKS[@]}; do
+		#echo $task 
+		#echo subtask keys: ${!SVCOMP_CATS[@]}
+		if [ "$task" == svcomp14 ] || [ "$task" == svcomp15 ];
+		then subtasks=${SVCOMP_CATS}; 
+		else subtasks=$task; fi
+
+		#echo subtasks=$subtasks
+		for subtask in $subtasks; do
+			#echo subtask=$subtask task=$task
+			if [ $subtask == $task ]; then stat_file=$VARROLES_LOGS_DIR/logs_`echo $task | tr '/' '_'`/statistics_svm.txt;
+			else
+				stat_file=$VARROLES_LOGS_DIR/logs_$subtask/statistics_svm.txt;
+			fi
+			tail -n +2 $stat_file >> $1
+		done
+	done
+	head -n 1 $stat_file | cat - $1 > $TMP && mv $TMP $1
+}
+
+roles_per_file()
+{
+	#echo \$1=$1 \$2=$2
+	rm -f $1
+	for task in ${TASKS[@]}; do
+		#echo $task 
+		#echo subtask keys: ${!SVCOMP_CATS[@]}
+		if [ "$task" == svcomp14 ] || [ "$task" == svcomp15 ];
+		then subtasks=${SVCOMP_CATS}; 
+		else subtasks=$task; fi
+
+		#echo subtasks=$subtasks
+		for subtask in $subtasks; do
+			#echo subtask=$subtask task=$task
+			if [ $subtask == $task ]; then stat_file=$VARROLES_LOGS_DIR/logs_`echo $task | tr '/' '_'`/statistics.txt;
+			else
+				stat_file=$VARROLES_LOGS_DIR/logs_$subtask/statistics.txt;
+			fi
+			#echo $stat_file
+			stat_ln=1
+			while true; do
+				#echo stat_portion
+				get_file_portion "$stat_file" "$stat_ln" "/svcomp${SVCOMP}" $stat_portion
+				stat_ln=$linenum
+				if [ ! -f $stat_portion ]; then #echo "empty stat_portion stat_ln=$stat_ln stat_file=$stat_file";
+					break;
+				fi
+
+				#cat $stat_portion
+				bench_dir=`readlink -f $BENCHMARK_DIR`
+				filename=`cat $stat_portion | grep -v "N\/A" | grep "\/"`
+				if [ ! -f "$filename" ]; then
+					echo File $filename does not exist; exit 1;
+				fi
+				filename=`echo $filename | xargs readlink -f` # | sed 's#^'$bench_dir'\/##'`
+				debug $filename #subtask=$subtask 
+				#get_file_category $filename
+
+				#sed 's#^'$file'\/[a-zA-Z0-9\.\-\/_][a-zA-Z0-9\.\-\/_]* \(.*\)$#\1 '$score'#' ${output} > TMP && mv TMP roles_loops
+				#echo -n "$filename" >> $output
+				roles=""
+				for role in ${ROLES[@]}; do
+					role_frequency $role $stat_portion
+					#if [ $freq != "0.00" ]; then echo task=$task subtask=$subtask role=$role freq=$freq; fi
+					freq=`echo "scale=10; ($freq / 100)" | bc`			
+					roles=`printf "$roles %.2f" $freq`
+					#echo $role $freq
+				done
+				echo $filename $roles >> $1
+			done
+		done
+	done
+
+	#cp $1 ${1}_bu
+	LANG=en_EN sort -k1,1 $1 > $TMP && mv $TMP $1 #sort the output
+	echo "$2" | cat - $1 > $TMP && mv $TMP $1 #prepend the header
+}
+
+#cp ${output} ~/roles_loops.csv
+#mv output /files/demy/tools/machine_learning/weka/weka-3-6-8/svm_benchmarks_vs_systemcode.csv
+
+loops_per_file()
+{
+	#echo loops_per_file LOOPS_OUTPUT=$LOOPS_OUTPUT
+	tail -n +2 $LOOPS_OUTPUT | tr '\t' ' ' > ${TMP}_loops #remove the header
+	#normalise ${TMP}_loops	#normalise the values to the interval [0,1]
+	LANG=en_EN sort ${TMP}_loops > $TMP && mv $TMP ${TMP}_loops #sort the file
+	#append the header
+	header="file `head -n 1 $LOOPS_OUTPUT | tr '\t' ' ' | cut -f 2- -d ' '`"
+	echo $header | cat - ${TMP}_loops > $TMP && mv $TMP ${TMP}_loops 
+}
+
+get_property()
+{
+#	if [ "`echo $1 | grep memsafety`" != "" ]; then
+#		prop="1."
+#	else
+#		prop="2."
+#	fi
+	line_num=`cat ${TMP}_joined | wc -l`
+	cut -f 1 -d ' ' ${TMP}_joined > ${TMP}_files
+	cat ${TMP}_files | grep memsafety | sed -e 's/$/ 1/' > ${TMP}1
+	cat ${TMP}_files | grep -v memsafety | sed -e 's/$/ 2/' > ${TMP}2
+	cat ${TMP}1 ${TMP}2 > $1
+	sort_file $1 $1 false
+}
+
+get_expected_result()
+{
+	if [ $SVCOMP == 15 ] || [ $SVCOMP == 14 ] || [ $SVCOMP == 13 -a "`echo $1 | grep memsafety`" != "" ]; then
+		safe_suffix="_true"
+		unsafe_suffix="_false"
+	else
+		safe_suffix="_safe"
+		unsafe_suffix="_unsafe"
+	fi
+
+	if [ "`echo $1 | grep $safe_suffix`" != "" ]; then
+		safe=1.
+	elif [ "`echo $1 | grep $unsafe_suffix`" != "" ]; then
+		safe=2.
+	else
+		echo "could not determine if $1 is safe/unsafe"; exit 1;
+		safe=3.
+	fi
+}
+
+get_besttool()
+{
+	besttool_name=`cat $besttool_filename | grep $1 | cut -f 2 -d ' '`
+	# cat scores
+	if [ "$besttool_name" == "" ]; then echo $1: best tool not found; exit 1; fi
+}
+
+append_fileprop_score()
+{
+	header=`head -n 1 ${TMP}_joined`
+	#echo header=$header;
+	tail -n +2 ${TMP}_joined > $TMP && mv $TMP ${TMP}_joined
+	local line=""
+#	for ((tool=0;tool<$SVCOMP_TOOLS_NUM;tool++)); do
+#		get_output $tool
+#		rm -f $output
+#	done
+
+	debug 'extracting property'
+	get_property ${TMP}_prop
+	join ${TMP}_joined ${TMP}_prop > ${TMP} && mv ${TMP} ${TMP}_joined
+
+	if [ "$property" == true ]; then header="$header prop"; fi
+	if [ "$expected_result" == true ]; then header="$header expres"; fi
+	if [ $besttool != true ]; then header="$header score"; else header="$header isbest"; fi
+
+	if [ $besttool_ova == true ]; then
+		debug 'appending best_tool'
+		cat <( echo $header) <( tail -n +2 ${TMP}_res | uniq | sort ) > $TMP && mv $TMP ${TMP}_res
+		for ((tool=0;tool<${SVCOMP_TOOLS_NUM};tool++)) do
+			get_output $tool
+			let col=tool+1;
+			tail -n +2 $besttool_ova_filename | cut -f 1,$col -d ' ' | sort > $TMP
+			LANG=en_EN join --header <( cat ${TMP}_res ) <( echo file best_tool_ova | cat - $TMP ) > $output
+		done
+	else
+		debug 'appending score'
+		for ((tool=0;tool<${SVCOMP_TOOLS_NUM};tool++)); do
+			get_output $tool
+			let col=tool+2
+			cut -f 1,$col -d ' ' ${SVCOMP_SCORES} | sed 's#+$#1#;s#-$#2#;s#?$#3#;s#0$#3#' | tail -n +2 > ${TMP}_score
+			#echo `cat ${TMP}_score | wc -l` lines in ${TMP}_score
+			join ${TMP}_joined ${TMP}_score > $TMP
+			echo $header | cat - $TMP > $output
+			#echo `cat $output | wc -l` lines in $output
+			#echo output=$output
+		done
+	fi
+}
+
+joined_with_loops=y
+
+extract_roles_metrics()
+{
+	#read -p "Starting from scratch!!! (y/n): " yn
+	#case $yn in
+	#[Yy]* ) ;;
+	#* ) exit;;
+	#esac	
+	rm -f $joined ${TMP}_roles*
+
+	if [ "$svcomp_assert_vars_only" != true ]; then
+		input_file=statistics.txt
+		debug "extracting roles..."
+		#roles_per_file ${TMP}_roles "file `echo ${ROLES[@]}`"
+		cat_roles ${TMP}_roles
+	fi
+
+	sort_file ${TMP}_roles ${TMP}_roles true
+	cp ${TMP}_roles $roles_metrics
+}
+
+extract_loop_metrics()
+{
+#	if [ $with_loops == true ]; then
+		debug "extracting loops..."
+		loops_per_file;
+		col=`head -n 1 ${TMP}_loops | wc -w`
+		let col-=4
+		cut -f 1-$col -d ' ' ${TMP}_loops > $loops_metrics;
+
+#	fi
+#	cp ${TMP}_joined ${joined}
+}
+
+create_input()
+{
+#	read -p "Starting from scratch? (y/n): " scratch
+#	case $scratch in
+#		[Yy]* ) ;;
+#        [Nn]* ) read -p "Enter the path to the joined file: " joined;
+#			read -p "Does the file contain loops? ([y]/n):" joined_with_loops; 
+#			echo joined=$joined joined_with_loops=$joined_with_loops;;
+#		* ) echo "Please answer yes or no.";;
+#	esac
+
+#	if [ $scratch != 'y' ] && [ -f ${joined} ]; then cp ${joined} ${TMP}_joined;
+#	else 
+#	fi
+
+#	if [ ! -f ${joined} ] || [ $joined_with_loops == 'n' ]; then
+#	fi
+
+	#echo joining with loops...
+	#echo header of joined: `head -n 1 ${TMP}_joined`
+	if [ "$loops_metrics" != "" ]; then
+		debug "joining $roles_metrics and $loops_metrics"
+		LANG=en_EN join --header $roles_metrics $loops_metrics > ${TMP}_joined
+		debug "(`cat $roles_metrics | wc -l` + `cat $loops_metrics | wc -l` = `cat  ${TMP}_joined | wc -l` lines)"
+	else
+		cp $roles_metrics ${TMP}_joined
+		debug "(`cat $roles_metrics | wc -l` + 0 = `cat  ${TMP}_joined | wc -l` lines)"
+	fi
+	cat ${TMP}_joined | sed 's#^'${BENCHMARK_DIR}/'##' > ${TMP} && mv ${TMP} ${TMP}_joined
+	#echo header of joined: `head -n 1 ${TMP}_joined`
+
+	if [ $only_features != true ]; then
+		#echo reading the tools...
+		#init_tools
+		debug "appending the rest..."
+		append_fileprop_score
+	else
+		#cp ${TMP}_joined $output_dir/$output_prefix
+		line_num=`cat ${TMP}_joined | wc -l`
+		let line_num--
+		echo ans > $TMP
+		printf '1\n%.0s' `seq 1 1 $line_num` >> $TMP
+		paste -d ' ' ${TMP}_joined $TMP > $output_dir/${output_prefix}
+	fi
+}
+
+sort_file()
+{
+	if [ "$3" == true ]; then
+		head -n 1 $1 > ${TMP}1
+		tail -n +2 $1 > ${TMP}2
+	else
+		cp $1 ${TMP}2
+	fi
+	LANG=en_EN sort -k1,1 ${TMP}2 > ${TMP}3
+
+	if [ "$3" == true ]; then
+		cat ${TMP}1 ${TMP}3 > $2
+	else
+		cp ${TMP}3 $2
+	fi
+
+	rm -f ${TMP}{1,2,3}
+}
+
+split_cols()
+{
+	sort_file $input_file ${TMP}_sorted true
+	col_num=`head -n 1 $input_file | wc -w`
+	#echo input_file=$input_file output_file=$output_file
+
+	for ((col=2;col<=$col_num;col++));do
+		#echo i=$i col=$col col_num=$col_num
+		let i=col-2
+		cut -f 1,${col} -d ' ' $input_file > ${output_file}_${i}
+	done
+}
+
+create_weights1()
+{
+	tail -n +2 $input_file | cut -f 1 -d ' ' > $TMP
+	echo file weight > $output_file
+	while read line; do
+		echo $line 1 >> $output_file
+	done < $TMP
+
+	for ((i=0;i<$output_num;i++)); do
+		cp $output_file ${output_file}_$i
+	done
+	rm -f $output_file
+}
+
+if [ "$extract_roles_metrics" == true ]; then
+	extract_roles_metrics
+fi
+
+if [ "$extract_loop_metrics" == true ]; then
+	extract_loop_metrics
+fi
+
+if [ "$create_input" == true ]; then
+	create_input
+fi
+
+if [ "$do_split_cols" == true ]; then
+	split_cols
+fi
+
+if [ "$do_sort_file" == true ]; then
+	sort_file $input_file $output_file true
+fi
+
+if [ "$do_create_weights1" == true ]; then
+	create_weights1
+fi
+
+#rm -f ${TMP}
+rm -f ${stat_portion}
+debug "TMP = $TMP"

@@ -1,0 +1,696 @@
+#!/bin/bash
+
+#BENCHMARK_DIR="/home/demy/phd/repos/proseed/variable_roles/benchmarks"
+#SVCOMP_XML_RESULTS=../../benchmarks/svcomp14/results/data/results-xml-raw #$1
+#contr_file=$2
+XML_CUSTOM_PATH=../../sv-benchmarks/c
+#TMP=$(mktemp)
+#echo TMP=$TMP
+
+echo $@
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        "-output-dir") shift; SVCOMP_RESULTS_PROCESSED=$1;;
+		#"-input-dir") shift; SVCOMP_XML_RESULTS=$1;;
+		#"-normalise-weights") shift; NORMALISE_WEIGHTS=true; SUFF=normalised;;
+		"-norm-by-score-time") NORM_BY_SCORE_TIME=true; SUFF=norm_by_score_time;;
+		#"-SVCOMP") shift; SVCOMP=$1;;
+		"-suff") shift; SUFF=$1;;
+		"-extract-times") shift; EXTRACT_TIME=true;;
+		"-extract-witness-times") shift; EXTRACT_WITNESS_TIME=true;;
+		"-extract-witness-answers") shift; EXTRACT_WITNESS_ANS=true;;
+		"-extract-answers") shift; EXTRACT_ANSWERS=true;;
+		"-extract-scores") shift; CALCULATE_SCORES=true;;
+		"-get-best-tool") shift; GET_BEST_TOOL=true;;
+    esac
+    shift
+done
+
+if [ "$SVCOMP_RESULTS_PROCESSED" == "" ]; then
+	echo specify the output directory; exit 1;
+elif [ "$SVCOMP_XML_RESULTS" == "" ]; then
+	echo specify the input directory; exit 1;
+elif [ "$SVCOMP" != "14" ] && [ "$SVCOMP" != "15" ]; then
+	echo specify SVCOMP year; exit 1;
+fi
+
+mkdir -p $SVCOMP_RESULTS_PROCESSED
+
+#SVCOMP_SRC=$BENCHMARK_DIR/SVCOMP${SVCOMP}
+
+if [ "$SVCOMP" == "14" ]; then
+	BENCHES="BitVectors Concurrency ControlFlowInteger DeviceDrivers64 Loops ProductLines HeapManipulation MemorySafety Recursive Sequentialized Simple"
+	XML_PATH="*results*\.xml"
+	INCORRECT_FALSE=-4
+	INCORRECT_TRUE=-8
+	SVCOMP_TOOLS="blast cbmc cpachecker cpalien cseq-lazy cseq-mu esbmc fbit llbmc predator symbiotic threader ufo ultimateAutomizer ultimateKojak"
+
+elif [ "$SVCOMP" == "15" ]; then
+	BENCHES="Arrays BitVectors Concurrency ControlFlowInteger DeviceDrivers64 ECA Loops ProductLines HeapManipulation MemorySafety Recursive Sequentialized Simple Floats Termination-crafted"
+	XML_PATH="*results.sv-comp15.*.xml"
+	INCORRECT_FALSE=-6
+	INCORRECT_TRUE=-12
+#	SVCOMP_TOOLS="aprove beagle blast cascade cbmc cpachecker cparec esbmc forester forest function hiptnt lazycseq map2check mucseq perentie predatorhp seahorn smack ulcseq ultimateautomizer ultimatekojak"
+fi
+
+correct_answers=$SVCOMP_RESULTS_PROCESSED/correct_answers
+categories=""
+declare -A cat_size
+declare -A tool_score
+declare -A tool_time
+declare -A tool_corr
+declare -A tool_k1
+declare -A tool_k3
+
+get_expected_result()
+{
+	local filename=$1
+	true_pos=`echo $filename | grep -b -o "_true" | cut -d ':' -f 1`
+	false_pos=`echo $filename | grep -b -o "_false" | cut -d ':' -f 1`
+	if [ "$false_pos" == "" ] || ([ "$true_pos" != "" ] && [ $true_pos -lt $false_pos ]); then
+		expected_res=true;
+	else
+		expected_res=false;
+	fi
+}
+
+init()
+{
+	for bench in $BENCHES; do
+		config=${SVCOMP_SRC}/${bench}.set
+		cat=`basename $config | sed 's%^\([^\.][^\.]*\)\..*%\1%'`
+		#echo config=$config cat=$cat
+		cat $config | sed '/^\s*$/d' | sed 's!^!'${SVCOMP_SRC}/'!' > ${TMP}
+		rm -f ${TMP}_${cat}
+		while read line; do
+			if [ "$line" != "" ]; then
+				find ${SVCOMP_SRC}/ -path "$line" | sed 's!^'$SVCOMP_SRC/'!!' >> ${TMP}_${cat};
+				#if [ `find ${SVCOMP_SRC} -path "$line" | sed 's!^'$SVCOMP_SRC/'!!' | wc -l` == 0 ]; then
+				#echo "line=$line `find ${SVCOMP_SRC} -path "$line" | sed 's!^'$SVCOMP_SRC/'!!' | wc -l` files added";
+				#fi
+			fi
+		done < ${TMP}
+		#echo ${TMP}_${cat}: `cat ${TMP}_${cat} | wc -l` lines
+		LANG=en_EN sort -k1,1 ${TMP}_${cat} > $TMP && mv $TMP ${TMP}_${cat}
+		#echo ${TMP}_${cat}: `cat ${TMP}_${cat} | wc -l` lines
+
+		categories="$categories $cat"
+		cat_size[$cat]=`cat ${TMP}_${cat} | wc -l`
+	done
+}
+
+get_average_times_scores()
+{
+	echo "get average times and scores..."
+	tail -n +2 $SVCOMP_RESULTS_PROCESSED/scores3 > $SVCOMP_RESULTS_PROCESSED/scores3_data
+	scores3_file=$SVCOMP_RESULTS_PROCESSED/scores3_data
+	col_num=`head -n 1 $scores3_file | wc -w`
+
+	for cat in $categories; do
+		for ((tool=0;tool<$col_num-1;tool++));do
+			tool_score[${tool}_${cat}]=0
+			tool_time[${tool}_${cat}]=0
+			tool_corr[${tool}_${cat}]=0
+		done
+		tool_time[min_${cat}]=1500
+		tool_time[sum_${cat}]=0
+	done
+
+	linenum=0
+	answers=answers; times=times
+	tail -n +2 $SVCOMP_RESULTS_PROCESSED/$times > $SVCOMP_RESULTS_PROCESSED/${times}_data
+	tail -n +2 $SVCOMP_RESULTS_PROCESSED/scores3 > $SVCOMP_RESULTS_PROCESSED/scores3_data
+	while read scores3_line; do
+		let linenum++
+		filename=`echo $scores3_line | tr -s ' ' | cut -d ' ' -f 1`
+		echo $filename
+		scores3_line="`echo $scores3_line | tr -s ' ' | cut -d ' ' -f 2-`"
+
+		filename_prep=`echo "$filename" | sed 's#\.#\\\.#g'`
+		times_line=`cat $SVCOMP_RESULTS_PROCESSED/${times}_data | grep "^$filename_prep "  | tr -s ' ' | cut -d ' ' -f 2-`
+		if [ "$times_line" == "" ]; then error "get_average_times_scores(): file $filename not found in $SVCOMP_RESULTS_PROCESSED/$times"; fi
+
+		#echo scores3_line=$scores3_line
+		get_num_scores $filename "$scores3_line" "$times_line"
+		scores3_arr=($scores3_line);
+		time_arr=($times_line);
+
+		if [ "${#scores3_arr[@]}" != "${#time_arr[@]}" ]; then
+			error "column number differ: scores3=$scores3_line times=$times_line filename=$filename filename_prep=$filename_prep"
+		fi
+
+		get_file_category $filename_prep
+		for ((tool=0;tool<$col_num-1;tool++)); do
+			score=${num_scores[$tool]}
+			let tool_score[${tool}_${cat}]=${tool_score[${tool}_${cat}]}+$score
+			time=`echo ${time_arr[$tool]} | sed 's%?%0%'`
+			if [ $score -gt 0 ]; then
+				tool_time[${tool}_${cat}]=`echo "scale=6; ${tool_time[${tool}_${cat}]} + $time" | bc`
+				let tool_corr[${tool}_${cat}]=${tool_corr[${tool}_${cat}]}+1
+			fi
+		done
+	done < $SVCOMP_RESULTS_PROCESSED/scores3_data
+
+	for cat in $categories; do
+		tool_score[max_${cat}]=${tool_score[0_${cat}]}
+		for ((tool=0;tool<$col_num-1;tool++)); do
+			if [ ${tool_score[max_${cat}]} -lt ${tool_score[${tool}_${cat}]} ]; then
+				tool_score[max_${cat}]=${tool_score[${tool}_${cat}]}
+			fi
+			if [ ${tool_corr[${tool}_${cat}]} -gt 0 ]; then
+				tool_time[${tool}_${cat}]=`echo "scale=6; ${tool_time[${tool}_${cat}]}/${tool_corr[${tool}_${cat}]}" | bc`
+			fi
+			tool_time[sum_${cat}]=`echo "scale=6; ${tool_time[sum_${cat}]}+${tool_time[${tool}_${cat}]}" | bc`
+			if [ `echo "scale=6; ${tool_time[${tool}_${cat}]} > 0" | bc` == 1 ]	&& \
+				[ `echo "scale=6; ${tool_time[min_${cat}]} > ${tool_time[${tool}_${cat}]}" | bc` == 1 ]; then
+				tool_time[min_${cat}]=${tool_time[${tool}_${cat}]}
+			fi
+		done
+	done
+
+	for cat in $categories; do
+		echo "cat=$cat tool_score[max_cat]=${tool_score[max_${cat}]}"
+		echo "tool_time[min_${cat}]=${tool_time[min_${cat}]} tool_time[sum_${cat}]=${tool_time[sum_${cat}]}"
+		for ((tool=0;tool<$col_num-1;tool++)); do
+			tool_k1[${tool}_${cat}]=`echo "scale=6; 1/l(${tool_time[sum_${cat}]}/${tool_time[min_${cat}]})" | bc -l`
+			tool_k3[${tool}_${cat}]=`echo "scale=6; ${tool_score[${tool}_${cat}]}/${tool_score[max_${cat}]}" | bc`
+			if [ `echo "scale=6; ${tool_k3[${tool}_${cat}]}<0" | bc` == 1 ]; then tool_k3[${tool}_${cat}]="0.001"; fi
+			echo "tool=$tool tool_score[${tool}_${cat}]=${tool_score[${tool}_${cat}]}"
+			echo "k1=${tool_k1[${tool}_${cat}]} k3=${tool_k3[${tool}_${cat}]}"
+		done
+	done
+}
+
+get_file_category()
+{
+	cat=""
+	for c in $categories; do
+		if [ "`grep "$1" ${TMP}_${c}`" != "" ]; then cat=$c; break; fi
+	done
+	if [ "$cat" == "" ]; then error "couldn't detect category for $1"; fi
+}
+
+get_toolname()
+{
+    tool=`echo $1 | sed -n "s/^.*\/\([^\/\.][^\/\.]*\)\..*$/\1/p"`
+	if [ "$tool" == "" ]; then echo file=$1 tool is empty; fi
+}
+
+extract_field()
+{
+	fieldname=$1; fileext=$2; witness=$3
+	echo extracting field $fieldname
+
+	# in the find command do not remove the slash after the directory name
+	for file in `find $SVCOMP_XML_RESULTS/ -name $XML_PATH`; do
+		get_toolname $file
+		rm -f $SVCOMP_RESULTS_PROCESSED/${tool}_${fileext}
+	done
+	
+	echo SVCOMP_XML_RESULTS=$SVCOMP_XML_RESULTS
+	echo XML_PATH=$XML_PATH
+	if [ "$witness" == true ]; then grep_cmd=""; else grep_opt="-v"; fi
+
+	for file in `find $SVCOMP_XML_RESULTS/ -name $XML_PATH | grep $grep_opt witnesscheck | grep -v "false" | grep -v "true"`; do
+		echo $file
+		get_toolname $file
+
+		sed -n '
+			/<!\-\-/, /\-\->/ {d}
+
+			/<sourcefile/, /<\/sourcefile>/ {
+				/^.*<sourcefile.*$/{
+					s#^.*name=\"'$XML_CUSTOM_PATH'\/\(.[^\"]*\)\".*$#\1 #
+					h
+				}
+
+				/^.*<column.* title=\"'$fieldname'\".*$/ {
+					s/^.*value=\"\(..*\)\".*$/\1/
+					H
+				}
+
+				/<\/sourcefile/{
+					g
+					s/\n/ /
+					p
+				}
+			}' $file >> $SVCOMP_RESULTS_PROCESSED/${tool}_${fileext}
+		LANG=en_EN sort -k1,1 $SVCOMP_RESULTS_PROCESSED/${tool}_${fileext} | tr -s ' ' > $TMP && mv $TMP $SVCOMP_RESULTS_PROCESSED/${tool}_${fileext}
+	done
+
+	echo TMP=$TMP
+	#echo finished extracting fields!!!
+	echo
+}
+
+error()
+{
+	echo "$1"; exit 1;
+}
+
+get_correct_answers()
+{
+	echo extracting correct answers
+	rm -f $correct_answers
+	get_file_list ${TMP}1
+	while read line; do
+		echo $line
+		words=($line)
+		filename=${words[0]} #`echo $line | sed -n 's#^\([^ ][^ ]*\) .*$#\1#p'`
+		get_expected_result $filename
+		echo $filename $expected_res >> $correct_answers
+	done < ${TMP}1
+}
+
+get_col_num()
+{
+	local file=$1
+	local toolname=$2
+	header=(`head -n 1 $file`)
+	found=false
+	for ((col=0;col<${#header[@]};col++)); do
+		if [ ${header[$col]} == $toolname ]; then found=true; break; fi
+	done
+	let col++
+	#if [ "$found" == false ]; then error "column $toolname not found in $file"; fi
+	#echo header=${header[@]} tool=$toolname col=$col
+}
+
+normalise_tool_answers()
+{
+	echo normalising tool answers
+	suff=$1
+	times=$2
+	limit=$3
+	true_ans=$4
+	false_ans=$5
+
+	rm -f ${SVCOMP_RESULTS_PROCESSED}/unknown
+	#files="`find $SVCOMP_RESULTS_PROCESSED -name "*_${suff}$" | grep -v correct | grep -v true | grep -v false | tr -s ' ' | tr ' ' '\n' | sort | tr '\n' ' '`"
+	#echo files=$files
+	
+	for toolname in $SVCOMP_TOOLS; do
+		file=${SVCOMP_RESULTS_PROCESSED}/${toolname}_${suff}
+		#toolname=`echo $file | xargs basename | sed -n 's%^\(.*\)_'$suff'%\1%p'`
+		get_col_num "$SVCOMP_RESULTS_PROCESSED/$times" $toolname
+		echo tool=$toolname
+		rm -f ${file}_normalised
+		while read line; do
+			#echo $line
+			filename=`echo $line | cut -f 1 -d ' '` #sed -n 's#^\([^ ][^ ]*\) .*$#\1#p'`
+			filename_prep=`echo "$filename" | sed 's#\.#\\\.#g'`
+			result="`echo $line | cut -f 2- -d ' '`" #sed -n 's#^[^ ][^ ]* \(.*\)$#\1#p'`"
+			#echo $filename
+
+			check_time=true
+			if [ "$check_time" == true ]; then
+				timei=`grep $filename_prep $SVCOMP_RESULTS_PROCESSED/$times | cut -f $col -d ' '`
+				if [ "$timei" == "" ]; then error "$filename is not found in $SVCOMP_RESULTS_PROCESSED/$times"; continue; fi
+				#if [ $toolname == cbmc ]; then limit=850; else limit=900; fi
+				overtime=`echo "scale=2; $timei > $limit" | bc`
+				#echo overtime=$overtime timei=$timei times=$times limit=$limit
+			fi
+			#echo timei=$timei overtime=$overtime
+			reported_result=$result
+			if [ "`echo $result | grep -i $true_ans`" != "" ] && [ $overtime != 1 ]; then
+				result=true
+			elif [ "`echo $result | grep -i $false_ans`" != "" ] && [ $overtime != 1 ]; then
+				result=false
+			else
+				if [ $overtime == 1 ] && ([ "`echo $reported_result | grep -i true`" != "" ] || [ "`echo $reported_result | grep -i false`" != "" ]); then echo $filename $toolname OVERTIME; fi
+				echo $result >> ${SVCOMP_RESULTS_PROCESSED}/unknown
+				result=unknown
+			fi
+
+			echo $filename $result >> ${file}_normalised
+		done < $file
+#		mv ${file}_normalised $file
+	done
+
+	if [ -f ${SVCOMP_RESULTS_PROCESSED}/unknown ]; then
+		sort ${SVCOMP_RESULTS_PROCESSED}/unknown | uniq | tr '[:upper:]' '[:lower:]' | uniq > $TMP && mv $TMP ${SVCOMP_RESULTS_PROCESSED}/unknown
+	fi
+}
+
+cust_sort()
+{
+	local file=$1
+	local wheader=$2
+	if [ "$wheader" == true ]; then
+		head -n 1 $file > ${TMP}_sort_1
+		tail -n +2 $file > ${TMP}_sort_2
+	else
+		rm -f ${TMP}_sort_1
+		cp $file ${TMP}_sort_2
+	fi
+	LANG=en_EN sort -k1,1 ${TMP}_sort_2 >> ${TMP}_sort_1
+	#echo "cp $1 ${1}_bu"
+	#cp $1 ${1}_bu
+	#echo "cp ${TMP}_sort_1 $1"
+	cp ${TMP}_sort_1 $1
+}
+
+join_with_missing_fields()
+{
+	#echo joining $1 and $2 '->' $3
+	cust_sort $1 false
+	cust_sort $2 false
+	cat $2 > ${TMP}_2
+
+	#join -v 1 <( sort -k1,1 $1 ) <( sort -k1,1 $2 ) | awk '{print $1,"?"}' >> ${TMP}_2
+ 	LANG=en_EN join -v 1 $1 $2 | awk '{print $1,"?"}' >> ${TMP}_2
+	LANG=en_EN sort ${TMP}_2 > $TMP && mv $TMP ${TMP}_2
+
+	# make sure the first columns in $1 and ${TMP}_2 are identical
+	#join -v 2 <( sort -k1,1 $1 ) <( sort -k1,1 ${TMP}_2 ) | awk '{print $1,"?"}' > ${TMP}_missing
+	LANG=en_EN join -v 2 $1 ${TMP}_2 | awk '{print $1,"?"}' > ${TMP}_missing
+	if [ `cat ${TMP}_missing | wc -l` -gt 0 ]; then
+		#cat ${TMP}_missing;
+		error "missing lines in the joined file! \$1=$1 \$2=$2";
+	fi
+
+	LANG=en_EN join $1 ${TMP}_2 > ${TMP}_joined && mv ${TMP}_joined $3 
+	if [ `cat $3 | wc -l` != `LANG=en_EN sort -k1,1 $3 | uniq | wc -l` ]; then error "found non-uniq lines in $3"; fi
+}
+
+get_tool_scores()
+{
+	ext_in=$1 ext_out=$2 with_dontknow=$3
+	wans_file=$4 wcorrect_ans=$5 wstatus_file=$6
+
+	echo computing tool scores
+	LANG=en_EN sort $correct_answers > ${correct_answers}_sorted
+	# for each answer determine whether it was correct '+' or incorrect '-'
+	for toolname in $SVCOMP_TOOLS; do
+		file="$SVCOMP_RESULTS_PROCESSED/${toolname}_${ext_in}"
+		#file in `find $SVCOMP_RESULTS_PROCESSED -name "*_${ext_in}" | grep -v true_answers`; do
+		#echo $file
+		#toolname=`basename $file | sed -n 's%^\(.*\)_'${ext_in}'%\1%p'`
+		#echo file=$file toolname=$toolname ext_in=$ext_in
+		file_output=${SVCOMP_RESULTS_PROCESSED}/${toolname}_${ext_out}
+		echo $file '->' ${file_output}
+		rm -f ${file_output}
+		LANG=en_EN sort -k1,1 $file > ${file}_sorted
+		LANG=en_EN join ${correct_answers}_sorted ${file}_sorted > $TMP
+
+		if [ "$wans_file" != "" ]; then
+			get_col_num "$SVCOMP_RESULTS_PROCESSED/$wans_file" $toolname
+			if [ $found == true ]; then wcol=$col; else wcol=-1; fi
+		fi
+
+		while read line; do	
+			words=($line)
+			filename=${words[0]}
+			filename_prep=`echo "$filename" | sed 's#\.#\\\.#g'`
+			get_file_category $filename_prep
+
+			if [ "$SVCOMP" == 15 ] && [ "`echo $filename | grep 'false-unreach-call'`" != "" ] && [ ${words[2]} == false ] && \
+			   [ "`echo Concurrency MemorySafety Termination-crafted Recursive | grep -w $cat`" == "" ]; then # correctly reported false
+				wansi=""
+				if [ $wcol -gt 0 ]; then
+					wansi=`grep $filename_prep $SVCOMP_RESULTS_PROCESSED/$wans_file | cut -f $wcol -d ' '`
+					witness_status=`grep $filename_prep $SVCOMP_RESULTS_PROCESSED/${toolname}_$wstatus_file`
+				fi
+				if [ "$wansi" != "$wcorrect_ans" ] && [ "`echo $witness_status | grep -i recursion`" == "" ]; then # no correct witness was provided
+					echo $toolname, $cat, $filename: no correct witness was provided, wansi=$wansi, "${words[2]} -> unknown"
+					words[2]=unknown
+				fi
+			fi
+
+			if [ "`echo true false unknown | grep -w ${words[2]}`" == "" ]; then
+				error "unexpected answer in file $file: ${words[0]} ${words[2]}"
+			elif [ "${words[1]}" == "${words[2]}" ]; then score="+"
+			elif [ $with_dontknow == true ] && [ ${words[2]} == "unknown" ]; then score="0"
+			else score="-"; fi
+			echo ${words[0]} $score >> ${file_output}
+			#echo ${words[0]} $score
+		done < $TMP
+	done
+
+	#find $SVCOMP_RESULTS_PROCESSED -name "*_sorted" | xargs rm -f
+}
+
+get_file_list()
+{
+	out=$1
+	rm -f $out
+
+	for bench in $BENCHES; do
+	cat ${SVCOMP_SRC}/${bench}.set | sed '/^\s*$/d' | sed 's!^!'${SVCOMP_SRC}/'!' > $TMP
+	#echo TMP=$TMP
+	#echo $bench
+	while read line; do
+		#echo line=$line
+		if [ "$line" != "" ]; then
+			find ${SVCOMP_SRC}/ -path "$line" >> $out
+			#find ${SVCOMP_SRC} -path "$line"
+		fi
+	done < $TMP
+	rm $TMP
+	done
+	LANG=en_EN sort $out | sed 's#'${SVCOMP_SRC}'/##' > $TMP && mv $TMP $out
+}
+
+join_all_files()
+{
+	echo joining files
+	fileext=$1
+	file_output=$2
+
+	# get the full list of files
+	FILE1=${TMP}1
+	get_file_list $FILE1
+
+	echo FILE1=$FILE1
+#	cut -f 1 -d ' ' $SVCOMP_RESULTS_PROCESSED/true_$fileext | sort > $FILE1
+
+	files=(`find $SVCOMP_RESULTS_PROCESSED -name "*_$fileext" | grep -v "true_$fileext" | grep -v "false_$fileext" | grep -v "correct_$fileext"`)
+	for file in ${files[@]}; do	files_str="$files_str `basename $file`"; done
+	files=(`echo $files_str | tr -s ' ' | tr ' ' '\n' | sort | tr '\n' ' '`)
+
+	# join all the files
+	for tool in $SVCOMP_TOOLS; do
+		#filebase in ${files[@]}; do
+		file=$SVCOMP_RESULTS_PROCESSED/${tool}_${fileext}
+		if [ ! -f $file ]; then touch $file; fi
+		#file=$SVCOMP_RESULTS_PROCESSED/${filebase}
+		echo $file
+		join_with_missing_fields $FILE1 $file $FILE1
+	done
+
+	# prepend the header
+	SVCOMP_TOOLS=""
+	for file in ${files[@]}; do SVCOMP_TOOLS="$SVCOMP_TOOLS `basename $file | sed 's%\(..*\)_'$fileext'%\1%'`"; done
+	echo 'file' ${SVCOMP_TOOLS[@]} | cat - $FILE1 > $SVCOMP_RESULTS_PROCESSED/$file_output
+
+#	find $SVCOMP_RESULTS_PROCESSED -name "*_$fileext" | xargs rm
+}
+
+get_num_scores()
+{
+	filename=$1; scores3_arr=($2); time_arr=($3);
+	num_scores=($2); #just to get an array of the same size
+	#echo num_scores=${num_scores[@]} scores3_arr=${scores3_arr[@]} time_arr=${time_arr[@]} \$1=$1 \$2=$2 \$3=$3
+
+	get_expected_result $filename
+	if [ "$expected_res" == "true" ]; then
+		maxscore=2
+		minscore=$INCORRECT_FALSE
+		correct='true'
+	elif [ "$expected_res" == "false" ]; then
+		maxscore=1
+		minscore=$INCORRECT_TRUE
+		correct='false'
+	else
+		error "incorrect filename=$filename";
+	fi
+	let maxdiff=maxscore-minscore
+
+	found=false
+	besttime=${time_arr[0]}
+	let thebest=${#scores3_arr[@]} # none
+
+	for ((i=0; i<${#scores3_arr[@]}; i++)); do
+		score3=${scores3_arr[$i]}
+		time=${time_arr[$i]}
+
+#		if [ "`cat ${contr_file}_${i}_contr_filenames | grep $filename`" != "" ]; then
+#			num_scores[$i]=$minscore
+#		el
+		if [ $score3 == '0' ] || [ $score3 == '?' ]; then num_scores[$i]=0
+		elif [ $score3 == '+' ]; then num_scores[$i]=$maxscore
+		elif [ $score3 == "-" ]; then num_scores[$i]=$minscore
+		else error "unexpected score3: $score3"
+		fi
+
+		if [ ${num_scores[$i]} -gt 0 ]; then
+			#echo i=$i besttime=$besttime time_arr_i=${time_arr[$i]}
+			if ( [ $found == false ] ) || ( [ $found == true ] && [ `echo "scale=2; ($besttime > $time)" | bc` == 1 ] ); then
+				besttime=$time; thebest=$i; found=true
+			fi
+		fi
+	done
+}
+
+no=2; yes=1;
+
+get_best_tool()
+{
+	scores3=$1 times=$2
+	SVCOMP_TOOLS="`head -n 1 $SVCOMP_RESULTS_PROCESSED/$scores3 | cut -d ' ' -f 2-`"
+	tail -n +2 $SVCOMP_RESULTS_PROCESSED/$scores3 > $SVCOMP_RESULTS_PROCESSED/${scores3}_data
+#| sed 's%?%unknown%g' 
+	tail -n +2 "$SVCOMP_RESULTS_PROCESSED/$times" > $SVCOMP_RESULTS_PROCESSED/${times}_data
+	rm -f $SVCOMP_RESULTS_PROCESSED/best_tool_* $SVCOMP_RESULTS_PROCESSED/weight*
+
+	linenum=0
+	weight_file=$SVCOMP_RESULTS_PROCESSED/weight_ova${SUFF}
+	echo file $SVCOMP_TOOLS > $SVCOMP_RESULTS_PROCESSED/best_tool_ova
+	echo file $SVCOMP_TOOLS > $weight_file
+	echo file $SVCOMP_TOOLS > $SVCOMP_RESULTS_PROCESSED/time_ova
+	echo file best_tool > $SVCOMP_RESULTS_PROCESSED/best_tool
+	echo file $SVCOMP_TOOLS > $SVCOMP_RESULTS_PROCESSED/num_scores
+
+	while read scores3_line; do
+		let linenum++
+		filename=`echo $scores3_line | tr -s ' ' | cut -d ' ' -f 1`
+		scores3_line="`echo $scores3_line | tr -s ' ' | cut -d ' ' -f 2-`"
+
+		filename_prep=`echo "$filename" | sed 's#\.#\\\.#g'`
+		times_line=`cat $SVCOMP_RESULTS_PROCESSED/${times}_data | grep "^$filename_prep "`
+		times_line="`echo $times_line | tr -s ' ' | cut -d ' ' -f 2-`"
+		if [ "$times_line" == "" ]; then error "file $filename not found in $SVCOMP_RESULTS_PROCESSED/$times"; fi
+
+		get_num_scores $filename "$scores3_line" "$times_line"
+		scores3_arr=($scores3_line);
+		time_arr=($times_line);
+
+		if [ "${#scores3_arr[@]}" != "${#time_arr[@]}" ]; then
+			error "column number differ: scores3=$scores3_line times=$times_line filename=$filename filename_prep=$filename_prep"
+		fi
+		get_file_category $filename_prep
+
+		num_correct=`echo ${scores3_arr[@]} | grep '+' | wc -w`
+		echo -n $filename >> $SVCOMP_RESULTS_PROCESSED/best_tool_ova
+		echo -n $filename >> $weight_file
+		echo -n $filename >> $SVCOMP_RESULTS_PROCESSED/time_ova
+		echo $filename "${num_scores[@]}" >> $SVCOMP_RESULTS_PROCESSED/num_scores
+
+		echo $filename
+		#echo $filename num_scores=${num_scores[@]} 
+		#echo scores3_line=$scores3_line times_line=$times_line
+
+		tinv_sum=0; tsum=0; tmin=1500; corr=0
+		for ((i=0; i<${#num_scores[@]}; i++)); do
+			if [ ${num_scores[$i]} -gt 0 ]; then
+				let corr++
+				if [ `echo "scale=6; ${time_arr[$i]} == 0" | bc` == 1 ]; then error "time_arr[$i]==0 !"; fi
+				if [ ${time_arr[$i]} == '?' ]; then error "time_arr[$i]==?"; fi
+				tinv_sum=`echo "scale=6; $tinv_sum + 1/${time_arr[$i]}" | bc`
+				tsum=`echo "scale=6; $tsum + ${time_arr[$i]}" | bc`
+				if [ `echo "scale=6; $tmin > ${time_arr[$i]}" | bc` == 1 ]; then tmin=${time_arr[$i]}; fi
+			fi
+		done
+
+		if [ `echo "scale=6; $tsum == $tmin" | bc` == 1 ]; then
+			the_only=true;
+		else
+			the_only=false;
+			k1=`echo "scale=6; 1/l($tsum/$tmin)" | bc -l`; k3=1;
+		fi
+		
+		if [ $corr -gt 0 ]; then k2=`echo "scale=6; $maxdiff/$corr" | bc`; fi
+		#echo looping trough numeric scores
+		for ((i=0; i<${#num_scores[@]}; i++)); do
+			runtime=${time_arr[$i]};
+
+			if [ $thebest -eq $i ]; then isbest=$yes; else isbest=$no; fi
+			if [ ${num_scores[$i]} -gt 0 ]; then k=1; else let k=$maxscore-${num_scores[$i]}; fi
+
+			w=$k;
+			if [ ${num_scores[$i]} -gt 0 ]; then
+				if [ $the_only == true ]; then
+					w=$k2
+				else
+					ti=${time_arr[$i]}
+					if [ "$NORM_BY_SCORE_TIME" != "" ]; then
+						k1=${tool_k1[${i}_${cat}]}
+						k3=${tool_k3[${i}_${cat}]}
+						ti=${tool_time[${i}_${cat}]}
+						tsum=${tool_time[sum_${cat}]}
+					fi
+					#echo "scale=6; l($tsum / $ti) * $k1 * $k2 * $k3"
+					w=`echo "scale=6; l($tsum / $ti) * $k1 * $k2 * $k3" | bc -l`
+					if [ `echo "scale=6; $w<0" | bc` == 1 ]; then
+						error "w=$w tsum=$tsum ti=$ti k1=$k1 k2=$k2 k3=$k3 i=$i";
+					fi
+				fi
+			fi
+			#echo w=$w k=$k k1=$k1 k2=$k2 score=${num_scores[$i]} rt=${time_arr[$i]} tsum=$tsum tmin=$tmin corr=$corr
+
+			if [ "$NORMALISE_WEIGHTS" == true ]; then w=`echo "scale=6; $w/${cat_size[$cat]}" | bc`; fi
+			let col=i+2
+			if [ "$NORM_BY_CORR_RATIO" == true ]; then w=`echo "scale=6; $w*${tool_perf[${col}_${cat}]}" | bc`; fi
+			#if [ `echo "scale=6; $w == 0" | bc` == 1 ]; then w=0.000001; fi
+			echo -n ' '$isbest >> $SVCOMP_RESULTS_PROCESSED/best_tool_ova
+			echo -n ' '$w >> $weight_file
+			echo -n ' '$runtime >> $SVCOMP_RESULTS_PROCESSED/time_ova
+		done
+
+		echo >> $SVCOMP_RESULTS_PROCESSED/best_tool_ova
+		echo >> $weight_file
+		echo >> $SVCOMP_RESULTS_PROCESSED/time_ova
+		echo $filename $thebest >> $SVCOMP_RESULTS_PROCESSED/best_tool
+	done < $SVCOMP_RESULTS_PROCESSED/${scores3}_data
+}
+
+#EXTRACT_TIME=false
+if [ "$EXTRACT_TIME" == true ]; then
+	echo creating 'times' files
+	extract_field 'cputime' 'time' false
+	join_all_files 'time' 'times'
+	cat "$SVCOMP_RESULTS_PROCESSED/times" | sed 's%?%0%g;s%\([0-9][0-9]*\.[0-9][0-9]*\)s%\1%g' > $TMP && mv $TMP "$SVCOMP_RESULTS_PROCESSED/times"
+fi
+
+#EXTRACT_WITNESS_TIME=true
+if [ "$EXTRACT_WITNESS_TIME" == true ] && [ "$SVCOMP" == 15 ]; then
+	echo creating 'witness_time' files
+	extract_field 'cputime' 'witness_time' true
+	join_all_files 'witness_time' 'witness_times'
+	cat "$SVCOMP_RESULTS_PROCESSED/witness_times" | sed 's%?%0%g;s%\([0-9][0-9]*\.[0-9][0-9]*\)s%\1%g' > $TMP && mv $TMP "$SVCOMP_RESULTS_PROCESSED/witness_times"
+fi
+
+#EXTRACT_WITNESS_ANS=true
+if [ "$EXTRACT_WITNESS_ANS" == true ] && [ "$SVCOMP" == 15 ]; then
+	echo extracting witnesses answers...
+	extract_field 'category' 'witness_answers' true
+	extract_field 'status' 'witness_status' true
+	normalise_tool_answers 'witness_answers' 'witness_times' 90 'correct' 'error' 
+	join_all_files 'witness_answers_normalised' 'witness_answers'
+fi
+
+#EXTRACT_ANSWERS=false
+if [ "$EXTRACT_ANSWERS" == true ]; then
+	echo creating 'answers' files...
+	extract_field 'status' 'answers' false
+	normalise_tool_answers 'answers' 'times' 900 'true' 'false'
+	join_all_files 'answers_normalised' 'answers'
+fi
+
+init
+#CALCULATE_SCORES=false
+if [ "$CALCULATE_SCORES" == true ]; then
+	get_correct_answers
+	if [ "$SVCOMP" == 14 ]; then wans_file=''; else wans_file='witness_answers'; fi
+	get_tool_scores 'answers_normalised' 'score3' true "$wans_file" 'true' 'witness_status'
+	join_all_files 'score3' 'scores3'
+fi
+
+#GET_BEST_TOOL=true
+if [ "$GET_BEST_TOOL" == true ]; then
+	if [ "$NORM_BY_SCORE_TIME" != "" ]; then
+		get_average_times_scores
+	fi
+	get_best_tool 'scores3' 'times'
+fi

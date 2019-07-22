@@ -1,0 +1,305 @@
+#!/bin/sh
+
+cpmin=0 #-5
+cpmax=8 #15
+gpmin=-4 #-15
+gpmax=2 #5
+
+
+#DEBUG=true
+
+debug()
+{
+	if [ "$DEBUG" != "" ]; then
+		echo $1;
+	fi
+}
+
+
+while [ $# -gt 0 ]; do
+	case "$1" in 
+		"-input") shift; INPUT=$1; debug "INPUT=$INPUT";;
+		"-output") shift; OUTPUT=$1; debug "OUTPUT=$OUTPUT";;
+		"-gen-input-only") GEN_FILES_ONLY=true; debug "GEN_FILES_ONLY is ON";;
+	esac
+	shift
+done
+
+if [ $INPUT == "" ]; then
+	echo specify -input; exit 1;
+elif [ "$OUTPUT" == "" ]; then
+	echo specify -output; exit 1;
+fi
+
+classify()
+{
+	train_file=$1
+	test_file=$2
+	failed=true
+	max_try=15
+	try=0
+	while [ $failed == true ] && [ $try -lt $max_try ]; do
+		let try++
+		SVMTorch -t 2 -c $c -std $g -multi $train_file ${TMP}_model > /dev/null
+		if [ $? -ne 0 ]; then echo "try again"; continue; fi
+		SVMTest -multi ${TMP}_model $test_file > ${TMP}_class
+		rm -f ${TMP}_model
+		if [ $? -ne 0 ]; then echo "try again"; continue; fi
+		failed=false
+	done
+	misclass=`cat ${TMP}_class | sed -n 's/^.*With multiclass: \([0-9][0-9]*\) missclassified \[.*\%\] on [0-9][0-9]* examples.*$/\1/p'`
+	str=`cat ${TMP}_class | grep "With multiclass"`
+	echo $str
+	if [ "$misclass" == "" ]; then
+		#SVMTest -multi ${TMP}_model $test_file > ${TMP}_class
+		echo misclass is empty; exit 1;
+	fi
+}
+
+kfold_cross_validation()
+{
+	input=$1
+	size=`cat $input | wc -l`
+
+	field_num=10
+	let part_size=$size/$field_num
+	#echo cross_validate_file input=$input size=$size field_num=$field_num part_size=$part_size
+	misclass_sum=0
+	for ((field=0; field<field_num; field++)); do
+		#echo field=$field
+		rm -f ${TMP}_train.cv ${TMP}_test.cv
+		shuf $input > ${TMP}_shuffed
+
+		let train_size1=$field*$part_size
+		if [ $train_size1 -gt 0 ]; then
+			head -n $train_size1 ${TMP}_shuffed >> ${TMP}_train.cv
+		fi
+
+		let test_offset=$train_size1+1
+		tail -n +$test_offset ${TMP}_shuffed | head -n $part_size >> ${TMP}_test.cv
+
+		let train_offset2=($field+1)*$part_size+1
+		if [ $train_offset2 -lt $size ]; then
+			tail -n +$train_offset2 ${TMP}_shuffed >> ${TMP}_train.cv
+		fi
+
+		let train_size=$size-$part_size
+		echo $train_size $vector_size | cat - ${TMP}_train.cv > ${TMP}_cv && mv ${TMP}_cv ${TMP}_train.cv;
+		echo $part_size $vector_size | cat - ${TMP}_test.cv > ${TMP}_cv && mv ${TMP}_cv ${TMP}_test.cv;
+
+		classify ${TMP}_train.cv ${TMP}_test.cv
+		let misclass_sum+=$misclass
+	done
+	#echo misclass_sum=$misclass_sum, test_size=$part_size
+}
+
+rbf_grid_search()
+{
+	c_opt=-1
+	g_opt=-1
+	misclass_opt=100
+	for ((cp=$cpmin; cp <= $cpmax; cp += 1)); do
+		for ((gp=$gpmin; gp <= $gpmax; gp += 1)); do
+			c=`echo "scale=10; (2 ^ ($cp))" | bc`
+			g=`echo "scale=10; (2 ^ ($gp))" | bc`
+			c=`printf '%.8f' $c`
+			g=`printf '%.8f' $g`
+			echo -n c=$c g=$g
+			#java weka.classifiers.functions.SMOreg -C $c -N 0 -I "weka.classifiers.functions.supportVector.RegSMOImproved -L 0.0010 -W 1 -P 1.0E-12 -T 0.0010 -V" -K "weka.classifiers.functions.supportVector.RBFKernel -C 250007 -G $g" -t $ifile -x 10 -o > $TMP
+			#echo vector_size=$vector_size
+			kfold_cross_validation ${TMP}_input_cv
+			#rel_error=`cat $TMP | sed -n '/Cross-validation/, /Total Number of Instances/ {s/Relative absolute error *\([0-9][0-9]\.[0-9][0-9]*\) *\%/\1/p}'`
+			misclass_rel=`echo "scale=2; ($misclass_sum * 100 / ($part_size * $field_num))" | bc`
+			not_optimal=`echo "scale=2; ($misclass_opt-$misclass_rel)>0" | bc`
+			if [ "$not_optimal" == "1" ]; then misclass_opt=$misclass_rel; c_opt=$c; g_opt=$g; fi
+			echo ' ' $misclass_rel
+			printf "%.2f %.2f %.2f" $c $g $misclass_rel >> ${ofile}_${train_part}
+		done
+	done
+	misclass_opt=`echo "scale=2; ($misclass_opt * 100 / ($part_size * $field_num))" | bc`
+	#misclass_opt=`printf "%.2f" $misclass_opt`
+}
+
+get_equal_proportion()
+{
+	correct=`cat $1 | grep '1\.$' | wc -l`
+	incorrect=`cat $1 | grep '2\.$' | wc -l`
+	dontknow=`cat $1 | grep '3\.$' | wc -l`
+	let fail=$incorrect+$dontknow
+	min=$correct
+	for num in $fail; do if [ $min -gt $num ]; then min=$num; fi; done
+	echo correct=$correct incorrect=$incorrect dontknow=$dontknow fail=$fail min=$min
+	cat $1 | grep '1\.$' | shuf -n $min > ${TMP}_correct
+	cat $1 | grep '2\.$' > ${TMP}_incorrect
+	cat $1 | grep '3\.$' > ${TMP}_dontknow
+	cat ${TMP}_incorrect ${TMP}_dontknow | shuf -n $min > ${TMP}_fail
+	cat ${TMP}_fail | sed 's%3\.$%2\.%' | cat - ${TMP}_correct | shuf > ${TMP}_input
+}
+
+min()
+{
+	if [ $1 -lt $2 ]; then	min=$1;
+	else min=$2; fi
+}
+
+max()
+{
+	if [ $1 -gt $2 ]; then	min=$1;
+	else min=$2; fi
+}
+
+
+def_cnt=10000 #20
+split_cat_equally()
+{
+	declare -a cats
+	cat_num=-1
+	min_count=-10
+	rm -f ${TMP}_input_cv ${TMP}_input_test
+	input=$1
+
+	for cat in ${SVCOMP_CATS}; do
+		config=$BENCHMARK_DIR/${cat}.set
+		let cat_num++
+		cat $config | sed '/^\s*$/d' | sed 's!^!'${BENCHMARK_DIR}/'!' > ${TMP}
+		rm -f ${TMP}_${cat}
+		while read line; do
+			if [ "$line" != "" ]; then find ${BENCHMARK_DIR}/ -path "$line" >> ${TMP}_${cat}; fi
+		done < ${TMP}
+		cat ${TMP}_${cat} | sed 's!^'$BENCHMARK_DIR/'!!' > $TMP && LC_ALL=C sort $TMP > ${TMP}_${cat}
+
+		LC_ALL=C join ${TMP}_${cat} ${TMP}_input > ${TMP}_${cat}_input
+#		for ((class=1;class<=$MAX_CLASS;class++)); do
+			#cat ${TMP}_${cat}_input | grep "\<$class\>$" | shuf > ${TMP}_shuffed
+			cat ${TMP}_${cat}_input | shuf > ${TMP}_shuffed
+
+			size=`cat ${TMP}_shuffed | wc -l`
+			debug "cat=$cat size=$size"
+			train_size=`echo "scale=2; $size*$train_part/100" | bc`
+			let train_size=`printf "%.0f" $train_size`
+			let tail_str=train_size+1
+			
+			if [ $train_size -gt 0 ]; then
+				head -n $train_size ${TMP}_shuffed >> ${TMP}_input_cv
+				tail -n +$tail_str ${TMP}_shuffed >> ${TMP}_input_test
+			else
+				echo train_size=0: class=$class cat=$cat
+			fi
+#		done
+
+		#cats[$cat_num]=$cat
+		#cat ${TMP}_config | sed '/^\s*$/d' > ${TMP}_${cat}
+		# filter input by cat
+
+		#grep ' +$' ${TMP}_${cat} > ${TMP}_${cat}_succ
+		#grep ' -$' ${TMP}_${cat} > ${TMP}_${cat}_incorrect
+		#grep ' ?$' ${TMP}_${cat} > ${TMP}_${cat}_dontknow
+		#cat ${TMP}_${cat}_incorrect ${TMP}_${cat}_dontknow > ${TMP}_${cat}_fail
+
+#		succ_count=`cat ${TMP}_${cat}_succ | wc -l`
+#		fail_count=`cat ${TMP}_${cat}_fail | wc -l`
+#		min $succ_count $fail_count
+#		max_lim=40
+#		if [ $min -lt $min_lim ]; then min=$min_lim; fi
+#		echo cat_num=$cat_num cat=$cat succ_count=$succ_count fail_count=$fail_count  min=$min
+
+#		if [ $cat_num -eq 0 ] || [ $min -lt $min_count ]; then
+#			min_count=$min
+#		fi
+	done
+
+	cat ${TMP}_input_cv | sort > TMP && mv TMP ${TMP}_input_cv
+	cat ${TMP}_input_test | sort > TMP && mv TMP ${TMP}_input_test
+
+#	echo min_count=$min_count
+	#rm ${TMP}_input
+	#cnt1=`cat ${TMP}_input | wc -l`
+
+	#for ((i=0; i<=$cat_num; i++)); do
+	#	cat=${cats[$i]}
+	#	shuf -n $def_cnt ${TMP}_${cat}_succ >> ${TMP}_input
+	#	cnt2=`cat ${TMP}_input | wc -l`
+	#	shuf -n $def_cnt ${TMP}_${cat}_fail >> ${TMP}_input
+	#	cnt3=`cat ${TMP}_input | wc -l`
+	#	let succ_cnt=cnt2-cnt1; let fail_cnt=cnt3-cnt2; cnt1=$cnt3;
+	#	echo cat=$cat success=$succ_cnt, failure=$fail_cnt
+	#done
+}
+
+classification()
+{
+	for ifile in $INPUT; do
+#		tail -n +2 $ifile | sed 's%\([1-3]\)\.[ $]%\1 %g' > ${TMP}_input
+
+		#sed 's%-%%g' | sed 's%^[a-zA-Z][a-zA-Z0-9\.\_\/]* %%' 
+
+		#ofilename=`echo $ifile | sed -n 's#^.*\/\([^\/]*\)$#\1_cross_validation#p'`
+		debug "$ifile ofile=$OUTPUT # $ofilename"
+
+		head -n 1 $ifile > ${TMP}_header
+#		tail -n +2 ${TMP}_input | sed 's/,//g' | sed 's/ [1-9][0-9]*$/ 1\./' | \
+#			sed 's/ \-[1-9][0-9]*$/ 2\./' | sed 's/ 0$/ 0\./' > ${TMP} && mv $TMP ${TMP}_input
+
+		#get_equal_proportion ${TMP}_input
+		tail -n +2 $ifile > $TMP && LC_ALL=C sort $TMP > ${TMP}_input
+		vector_size=`head -n 1 ${TMP}_input | wc -w`
+
+		ofile=$OUTPUT # "$OUTPUT_DIR/$ofilename"
+		debug "$ifile $ofile"
+		rm -f $ofile
+
+		#for ((train_part=50; train_part<=90; train_part+=10)); do
+		train_part=60
+			misclass_av=0
+			maxtest=5
+
+			#for ((testnum=0; testnum<maxtest; testnum++)); do
+				rm -f ${ofile}_${train_part}
+
+				#split the data into training part and testing part
+				split_cat_equally ${TMP}_input
+				debug "`cat ${TMP}_input | wc -l` lines in ${TMP}_input"
+				debug "`cat ${TMP}_input_cv | wc -l` lines in ${TMP}_input_cv"
+				debug "`cat ${TMP}_input_test | wc -l` lines in ${TMP}_input_test"
+
+				if [ "$GEN_FILES_ONLY" == true ]; then
+					sort ${TMP}_input_cv > ${TMP}_input_cv_sorted
+					sort ${TMP}_input_test > ${TMP}_input_test_sorted
+					com_cnt=`comm -12 ${TMP}_input_cv_sorted ${TMP}_input_test_sorted | wc -l`
+					if [ $com_cnt -gt 0 ]; then echo $com_cnt common lines in ${TMP}_input_cv_sorted and ${TMP}_input_test_sorted; comm -12 ${TMP}_input_cv_sorted ${TMP}_input_test_sorted > TMP4; exit; fi
+
+					LC_ALL=C sort ${TMP}_input_cv > ${TMP}_input_cv_sorted
+					LC_ALL=C sort ${TMP}_input_test > ${TMP}_input_test_sorted
+					cat ${TMP}_header ${TMP}_input_cv_sorted > ${OUTPUT}_train
+					cat ${TMP}_header ${TMP}_input_test_sorted > ${OUTPUT}_test
+					debug "`cat ${OUTPUT}_train | wc -l` lines in (${OUTPUT}_train)"
+					debug "`cat ${OUTPUT}_test | wc -l` lines in (${OUTPUT}_test)"
+					continue
+				fi
+
+				echo $test_size $vector_size | cat - ${TMP}_input_test > ${TMP}_test.1 && mv ${TMP}_test.1 ${TMP}_input_test
+				#rbf_grid_search
+				c_opt=2 g_opt=0.5
+				#printf "c_opt=%.2f g_opt=%.2f" $c_opt $g_opt >> $ofile
+				#printf " misclass_opt=%.2f" $misclass_opt >> $ofile
+				c=$c_opt g=$g_opt
+				echo $train_size $vector_size | cat - ${TMP}_input_cv > ${TMP}_cv.1 && mv ${TMP}_cv.1 ${TMP}_input_cv
+				classify ${TMP}_input_cv ${TMP}_input_test
+				#mv ${TMP}_class ${TMP}_class_${train_part}
+				#cp ${TMP}_input_cv $OUTPUT_DIR/cv_${train_part}
+				#cp ${TMP}_input_test $OUTPUT_DIR/test_${train_part}
+				#echo testing misclass=$misclass, test_size=$test_size
+				misclass=`echo "scale=2; ($misclass * 100 / $test_size)" | bc`
+				misclass_av=`echo "scale=2; $misclass_av + $misclass" | bc`
+				echo -n ' ' $misclass\% >> $ofile
+			#done
+			if [ "$GEN_FILES_ONLY" != true ]; then
+				misclass_av=`echo "scale=2; $misclass_av/$maxtest" | bc`
+				echo ' ' $misclass_av >> $ofile
+			fi
+		#done
+	done
+}
+
+classification
+#rm -f ${TMP} ${TMP}_*

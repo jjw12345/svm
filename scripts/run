@@ -1,0 +1,198 @@
+#!/bin/bash
+export LLVM=/files/demy/tools/clang
+export BD=${LLVM}/build
+export SD=${LLVM}/llvm
+
+CONFIG="${VARROLES_LOGS_DIR}/config"
+TIMING="${VARROLES_LOGS_DIR}/timing"
+
+#CFLAGS_INC="-I$BD/include -I$BD/tools/clang/include -I$BD/tools/clang/lib/Headers -I$BD/Debug+Asserts/lib/clang/3.5.1/include"
+#CFLAGS_STD="-D__STDC_CONSTANT_MACROS -D__STDC_LIMIT_MACROS"
+#CFLAGS="$CFLAGS_INC $CFLAGS_STD"
+CFLAGS="-I${PATH_TO_LLVM}/build/lib/clang/3.4.2/include -Qunused-arguments"
+PROFILER_PATH=/files/demy/tools/google_perftools/gperftools-2.2.90
+PROFILE=no
+MEASURE_TIME=yes
+SPLIT_CONFIG=no #yes
+
+debug()
+{
+	if [ "$DEBUG" != "" ]; then
+		echo "$1"
+	fi
+}
+
+
+create_tasks()
+{
+	debug "create_tasks \$1=$1 \$2=$2"
+
+	if [ ! -z "`echo $2 | xargs`" ]; then
+		debug "FILE=$2"
+		TASKS=( $2 );
+	else
+		TASKS=( ${SVCOMP_CATS} )
+#		case "$1" in
+#		"svcomp14")
+#			TASKS=(BitVectors Concurrency ControlFlowInteger DeviceDrivers64 HeapManipulation Loops MemorySafety ProductLines Recursive Sequentialized Simple);;
+#
+#		"svcomp15")
+#			TASKS=(Arrays BitVectors Concurrency ControlFlowInteger DeviceDrivers64 ECA Loops ProductLines HeapManipulation MemorySafety Recursive Sequentialized Simple Floats Termination-crafted);;
+#
+#		esac
+	fi
+
+	let TASKS_SIZE=${#TASKS[@]}-1
+	debug "tasks=${TASKS[@]} TASKS_SIZE=$TASKS_SIZE"
+}
+
+print_to_config ()
+{
+	#echo "print_to_config: p1=$1, p2=$2 p3=$3"
+	if [ $# -eq 1 ]; then
+		files=`find $BENCHMARK_DIR/ -name "$1"`
+	fi
+
+	if [ "$files" = "" ]
+	then
+		echo "find $BENCHMARK_DIR/ -name \"$1\": Files not found"
+		echo scripts/temp:
+		cat scripts/temp
+	else
+		echo "$files" >> $CONFIG
+	fi
+}
+
+create_svcomp_config()
+{
+	debug "\${BENCHMARK_DIR}/\$1.set="${BENCHMARK_DIR}/${1}.set
+	if [ -f ${BENCHMARK_DIR}/${1}.set ]; then
+		cat ${BENCHMARK_DIR}/${1}.set | sed '/^\s*$/d' | sed 's!^!'${BENCHMARK_DIR}/'!' > ${TMP}
+		while read line; do
+			if [ "$line" != "" ]; then
+				find ${BENCHMARK_DIR}/ -path "$line" >> $CONFIG
+			fi
+		done < ${TMP}
+		rm ${TMP}
+	else
+		file=$1;
+		if [ ! -f $file ]; then
+			echo File $file not found; exit 1;
+		else
+			echo $file > $CONFIG
+		fi
+	fi
+
+	debug "added `cat $CONFIG | wc -l` lines to $CONFIG"
+}
+
+create_config()
+{
+	if [ $1 == svcomp14 ] || [ $1 == svcomp15 ]; then
+#		CFLAGS="$CFLAGS -target x86_64 -w"
+		#BENCHMARK=$BENCHMARK_DIR/$1
+		create_svcomp_config $2
+
+	elif [ $1 == "test_input" ]; then
+		BENCHMARK_DIR=$TEST_DIR/src
+		print_to_config *.c
+
+	else
+		echo "unknown target: $1"; exit 1;
+	fi
+
+	if [ ! -f "$CONFIG" ]
+	then
+		echo CONFIG=$CONFIG does not exist;	exit 1
+	fi	
+}
+
+split_input()
+{
+	line_num=`cat $1 | wc -l`
+	max_lines=1000
+	let config_parts=(line_num+max_lines-1)/max_lines
+	debug "line_num=$line_num config_parts=$config_parts"
+	for ((i=0; i<config_parts;i++)); do
+		let start_line=max_lines*i+1
+		debug "i=$i start_line=$start_line"
+		tail -n +$start_line $1 | head -n $max_lines > ${CONFIG}_$i
+	done
+}
+
+tmpdir=/tmp/tmp_svcomp${SVCOMP}
+mkdir -p $tmpdir && rm -rf ${tmpdir}/*
+if [ "$DEBUG" == true ]; then
+DEBUG_FLAG="-debug"
+fi
+
+run_svcomp()
+{
+	rm -rf ${VARROLES_LOGS_DIR}/logs/*
+	for i in `seq 0 $TASKS_SIZE`
+	do
+		TASK=${TASKS[$i]}
+		TASK_WO_SLASHES=`echo $TASK | tr '/' '_'`
+		debug "TASK=$TASK '$@='$@TASK_WO_SLASHES=$TASK_WO_SLASHES"
+		rm -rf ${VARROLES_LOGS_DIR}/logs_${TASK_WO_SLASHES} $CONFIG
+		create_config $1 $TASK
+
+		debug "CFLAGS=$CFLAGS"
+		#valgrind --leak-check=full -v 
+		cmd="cd $tmpdir && $VARROLES -batch $CONFIG -timing $TIMING $DEBUG_FLAG -- $CFLAGS -fsyntax-only -w"
+		if [ "$SPLIT_CONFIG" == yes ]; then
+			split_input $CONFIG
+#		else
+#			cp $CONFIG ${CONFIG}_0
+#			config_parts=1
+		fi
+		if [ "$PROFILE" == "yes" ]; then
+			cmd="env LD_PRELOAD=$PROFILER_PATH/lib64/libprofiler.so CPUPROFILE=$VARROLES_LOGS_DIR/${TASK}.prof $cmd";
+			debug "PROFILING IS ON!";
+		fi
+		debug "command: $cmd"
+
+		cp $CONFIG ${CONFIG}_full
+		#for ((i=0; i<config_parts;i++)); do
+		while read line; do
+			#echo i=$i
+			#cp ${CONFIG}_$i ${CONFIG}
+			echo $line > $CONFIG
+			debug "$cmd" && eval "$cmd"
+
+			if [ $? -ne 0 ]; then
+				echo "${TASK}_${i} FAILED!!!"
+				echo "command: $cmd"
+				echo ${TASK}_${i} >> failed
+				#continue
+				exit 1
+			else
+				#echo "${TASK}_${i} SUCCEEDED"
+				cat logs/statistics.txt >> logs/statistics_full.txt
+				if [ -f logs/assert_log.txt ]; then cat logs/assert_log.txt >> logs/assert_log_full.txt; fi
+				cat logs/result.txt >> logs/result_full.txt
+				cat statistics.txt >> statistics_full.txt
+				if [ -f assert_log.txt ]; then cat assert_log.txt >> assert_log_full.txt; fi
+				if [ "$PROFILE" == yes ]; then mv $VARROLES_LOGS_DIR/$TASK.prof $VARROLES_LOGS_DIR/${TASK}.prof_${i}; fi
+			fi
+			rm -f logs/{statistics.txt,assert_log.txt,result.txt} statistics.txt assert_log.txt
+		done < ${CONFIG}_full
+		rm -f ${CONFIG}_full
+		debug "${TASK} SUCCEEDED"
+		mv logs/statistics_full.txt logs/statistics.txt
+		if [ -f logs/assert_log_full.txt ]; then mv logs/assert_log_full.txt logs/assert_log.txt; fi
+		mv logs/result_full.txt logs/result.txt
+
+		mv statistics_full.txt statistics_${TASK_WO_SLASHES}.txt
+		if [ -f assert_log_full.txt ]; then mv assert_log_full.txt assert_log_${TASK_WO_SLASHES}.txt; fi
+
+		mv logs $VARROLES_LOGS_DIR/logs_$TASK_WO_SLASHES
+	done
+}
+
+create_tasks $1 $2
+rm -f $TIMING;
+run_svcomp $@
+debug $cmd
+rm -f $CONFIG
+exit 

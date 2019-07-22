@@ -1,0 +1,15 @@
+#!/bin/bash
+#echo rm $@
+
+param=""
+while [ $# -gt 0 ] && [ "${1:0:1}" == "-" ]; do
+	param="$param $1";
+	shift;
+done
+#echo param=$param
+for file in $@; do
+	#echo rm $file
+	if [ -f $file ] || [ -d $file ]; then
+		mv $file /home/vagrant/trash/`echo ${file} | tr '/' '_'`_`date +'%d-%m-%y_%T'` #$param 
+	fi
+done

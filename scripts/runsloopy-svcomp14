@@ -1,0 +1,17 @@
+#!/bin/bash
+
+SVCOMP=${0#*-}
+INPUT=${SVCOMP}-perfile
+RESULT=$SLOOPY_LOGS_DIR/${SVCOMP}.csv
+DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+
+cd "$DIR"
+
+echo "Computing loop and CFG metrics for $SVCOMP ("$(wc -l "$INPUT" | cut -d' ' -f1)" verification tasks)" 1>&2
+
+echo
+echo Results will be available in $RESULT 1>&2
+
+echo -e "benchmark\tbounded\tterminating\tsimple\ttnont\thard\tfpcalls\tfpargs\tcfgblocks\tmaxindeg\ttimesloopy\ttimesloopyloop\ttimesloopycfg\ttimesloopyparse" >$RESULT
+
+./runsloopy <$INPUT >>$RESULT

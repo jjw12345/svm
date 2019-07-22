@@ -1,0 +1,65 @@
+#!/bin/bash
+
+tmp=${TMP}
+
+ova=$1
+svcomp=svcomp$2
+output=$3
+
+#DEBUG=true
+
+debug()
+{
+	if [ "$DEBUG" != "" ]; then
+		echo $1;
+	fi
+}
+
+if [ "$svcomp" == "svcomp14" ]; then
+	CATS="BitVectors Concurrency ControlFlowInteger DeviceDrivers64 Loops ProductLines HeapManipulation MemorySafety Recursive Sequentialized Simple"
+elif [ "$svcomp" == "svcomp15" ]; then
+	CATS="Arrays BitVectors Concurrency ControlFlowInteger DeviceDrivers64 ECA Loops ProductLines HeapManipulation MemorySafety Recursive Sequentialized Simple Floats Termination-crafted"
+fi
+categories=""
+for cat in $CATS; do
+	config=${BENCHMARK_DIR}/${cat}.set
+#for config in `find ${BENCHMARK_DIR} -name "*.set" | grep -v Stateful | grep -v DriverChallenges`; do
+#	cat=`basename $config | sed 's%^\([^\.][^\.]*\)\..*%\1%'`
+	cat $config | sed '/^\s*$/d' | sed 's!^!'${BENCHMARK_DIR}/'!' > ${tmp}
+	rm -f ${tmp}_${cat}
+	while read line; do
+		if [ "$line" != "" ]; then find ${BENCHMARK_DIR} -path "$line" >> ${tmp}_${cat}; fi
+	done < ${tmp}
+	cat ${tmp}_${cat} | sed 's!^'$BENCHMARK_DIR/'!!' | sort > $tmp && mv $tmp ${tmp}_${cat}
+
+	categories="$categories $cat"
+done
+
+categories="`echo $categories | tr ' ' '\n' | sort | tr '\n' ' '`"
+catnum=`echo $categories | wc -w`
+cati=1
+rm -f $output
+for cat in $categories; do
+	debug "$cat"
+	while read line; do
+#		echo $line
+		echo -n $line >> $output
+		if [ "$ova" == false ]; then
+			echo ' '$cati >> $output
+		else
+			for ((i=1;i<$cati;i++)); do echo -n ' '2 >> $output; done
+			echo -n ' '1 >> $output
+			for ((i=$cati+1;i<=$catnum;i++)); do echo -n ' '2 >> $output; done
+			echo >> $output
+		fi
+	done < ${tmp}_${cat}
+	let cati++
+done
+
+cat $output | sort -k 1,1 > $tmp
+if [ "$ova" == false ]; then
+	echo file catid > $output;
+else
+	echo file $categories > $output
+fi
+cat $tmp >> $output
